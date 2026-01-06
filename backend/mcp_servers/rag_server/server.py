@@ -1,444 +1,650 @@
 """
-MCP RAG Server - Centralized via LlamaStack
-All vector operations go through LlamaStack APIs
+MCP RAG Server - Vector retrieval using PostgreSQL + pgvector
+FastMCP implementation with SSE transport
+
+SIMPLE TOOLS: Return retrieved documents only.
+The LlamaStack agent handles all LLM synthesis and analysis.
+
+FIXES APPLIED:
+- Async database queries using asyncio.to_thread()
+- HTTP retry logic with tenacity
+- Embedding validation to prevent injection
+- Database connection check at startup
+- Proper error handling throughout
 """
 
 import asyncio
+import json
 import logging
 import os
-import time
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-
-# Import prompts
-from prompts import get_knowledge_base_synthesis_prompt
+from mcp.server.fastmcp import FastMCP
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Configure logging
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# FastAPI app
-app = FastAPI(
-    title="MCP RAG Server (LlamaStack-based)",
-    description="Vector search and retrieval via LlamaStack",
-    version="2.0.0",
-)
+# Create FastMCP server
+mcp = FastMCP("rag-server")
 
 # Configuration
-LLAMASTACK_ENDPOINT = os.getenv("LLAMASTACK_ENDPOINT", "http://localhost:8321")
-VECTOR_STORE_NAME = os.getenv("VECTOR_STORE_NAME", "claims_vector_db")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgresql.claims-demo.svc.cluster.local")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "claims_db")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "claims_user")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "ClaimsDemo2025!")
+LLAMASTACK_ENDPOINT = os.getenv(
+    "LLAMASTACK_ENDPOINT",
+    "http://llamastack-test-v035.claims-demo.svc.cluster.local:8321"
+)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemma-300m")
 
-# Global vector_store_id (retrieved at startup)
-_vector_store_id: Optional[str] = None
-
-
-# Pydantic models
-class RetrieveUserInfoRequest(BaseModel):
-    user_id: str
-    query: str
-    top_k: int = Field(default=5, ge=1, le=20)
-
-
-class RetrieveUserInfoResponse(BaseModel):
-    user_info: Dict[str, Any]
-    contracts: List[Dict[str, Any]]
-    similarity_scores: List[float]
-    source_documents: List[str]
-
-
-class RetrieveSimilarClaimsRequest(BaseModel):
-    claim_text: str
-    claim_type: Optional[str] = None
-    top_k: int = Field(default=10, ge=1, le=50)
-    min_similarity: float = Field(default=0.7, ge=0.0, le=1.0)
+# Database connection
+DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,  # Verify connections before use
+    pool_recycle=3600    # Recycle connections after 1 hour
+)
+SessionLocal = sessionmaker(bind=engine)
 
 
-class SimilarClaim(BaseModel):
-    claim_id: str
-    claim_number: str
-    claim_text: str
-    similarity_score: float
-    outcome: Optional[str]
-    processing_time: Optional[int]
+# =============================================================================
+# Database Utilities
+# =============================================================================
 
-
-class RetrieveSimilarClaimsResponse(BaseModel):
-    similar_claims: List[SimilarClaim]
-
-
-class SearchKnowledgeBaseRequest(BaseModel):
-    query: str
-    filters: Optional[Dict[str, Any]] = None
-    top_k: int = Field(default=5, ge=1, le=20)
-
-
-class KnowledgeBaseResult(BaseModel):
-    id: str
-    title: str
-    content: str
-    similarity_score: float
-    category: Optional[str]
-
-
-class SearchKnowledgeBaseResponse(BaseModel):
-    results: List[KnowledgeBaseResult]
-    synthesized_answer: str
-
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-
-
-# Helper functions
-async def get_vector_store_id() -> str:
-    """Get vector_store_id by name from LlamaStack."""
-    global _vector_store_id
-
-    if _vector_store_id:
-        return _vector_store_id
-
+def check_database_connection() -> bool:
+    """
+    Verify database connectivity on startup.
+    
+    Returns:
+        True if connection successful
+        
+    Raises:
+        Exception if connection fails
+    """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{LLAMASTACK_ENDPOINT}/v1/vector_stores",
-                params={"name": VECTOR_STORE_NAME}
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("data") and len(data["data"]) > 0:
-                    _vector_store_id = data["data"][0]["id"]
-                    logger.info(f"Retrieved vector_store_id: {_vector_store_id}")
-                    return _vector_store_id
-                else:
-                    raise ValueError(f"Vector store '{VECTOR_STORE_NAME}' not found")
-            else:
-                raise Exception(f"Failed to get vector_store: {response.status_code}")
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            # Check if pgvector extension is available
+            result = conn.execute(text(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')"
+            )).scalar()
+            if not result:
+                logger.warning("⚠️ pgvector extension not found - vector search may fail")
+        logger.info("✅ Database connection successful")
+        return True
     except Exception as e:
-        logger.error(f"Error getting vector_store_id: {str(e)}")
+        logger.error(f"❌ Database connection failed: {e}")
         raise
 
 
-async def vector_search_llamastack(
-    query: str,
-    collection: str,
-    top_k: int = 5,
-    filters: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
+async def run_db_query(query, params: dict) -> List[Any]:
     """
-    Perform vector search via LlamaStack API.
-    LlamaStack handles embedding creation and vector search.
+    Execute database query in thread pool (non-blocking).
+    
+    Args:
+        query: SQLAlchemy text query
+        params: Query parameters
+        
+    Returns:
+        List of result rows
     """
-    try:
-        vector_store_id = await get_vector_store_id()
+    def _execute():
+        with SessionLocal() as session:
+            try:
+                result = session.execute(query, params).fetchall()
+                return result
+            except Exception as e:
+                session.rollback()
+                raise
+    
+    return await asyncio.to_thread(_execute)
 
+
+async def run_db_query_one(query, params: dict) -> Optional[Any]:
+    """
+    Execute database query and return single result.
+    
+    Args:
+        query: SQLAlchemy text query
+        params: Query parameters
+        
+    Returns:
+        Single result row or None
+    """
+    def _execute():
+        with SessionLocal() as session:
+            try:
+                result = session.execute(query, params).fetchone()
+                return result
+            except Exception as e:
+                session.rollback()
+                raise
+    
+    return await asyncio.to_thread(_execute)
+
+
+# =============================================================================
+# Embedding Utilities
+# =============================================================================
+
+def format_embedding(embedding: List[float]) -> str:
+    """
+    Format embedding for pgvector, with validation.
+    
+    Args:
+        embedding: List of float values
+        
+    Returns:
+        Formatted string for pgvector
+        
+    Raises:
+        ValueError if embedding is invalid
+    """
+    if not embedding:
+        raise ValueError("Empty embedding")
+    
+    if not isinstance(embedding, list):
+        raise ValueError(f"Embedding must be a list, got {type(embedding)}")
+    
+    if not all(isinstance(x, (int, float)) for x in embedding):
+        raise ValueError("All embedding values must be numeric")
+    
+    # Validate reasonable bounds (embeddings are typically normalized)
+    if any(abs(x) > 100 for x in embedding):
+        logger.warning("Embedding contains unusually large values")
+    
+    return '[' + ','.join(map(str, embedding)) + ']'
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException)),
+    before_sleep=lambda retry_state: logger.warning(
+        f"Embedding API retry {retry_state.attempt_number}/3 after error"
+    )
+)
+async def create_embedding(text: str) -> List[float]:
+    """
+    Create embedding using LlamaStack Embeddings API.
+    
+    Includes retry logic for transient failures.
+    
+    Args:
+        text: Text to embed
+        
+    Returns:
+        List of floats representing the embedding vector
+        
+    Raises:
+        Exception if embedding creation fails after retries
+    """
+    if not text or not text.strip():
+        raise ValueError("Cannot create embedding for empty text")
+    
+    try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                f"{LLAMASTACK_ENDPOINT}/v1/vector-io/query",
+                f"{LLAMASTACK_ENDPOINT}/v1/embeddings",
                 json={
-                    "vector_db_id": vector_store_id,
-                    "query": query,
-                    "k": top_k,
-                    # Note: LlamaStack doesn't support collection/filters in query params yet
-                    # We filter results by metadata after retrieval
+                    "model": EMBEDDING_MODEL,
+                    "input": text.strip()
                 }
             )
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if "data" not in result or len(result["data"]) == 0:
+                logger.error(f"Unexpected embedding response format: {result}")
+                raise ValueError("Invalid embedding response format")
+            
+            embedding = result["data"][0].get("embedding")
+            
+            if not embedding:
+                raise ValueError("No embedding in response")
+            
+            logger.debug(f"Created embedding with dimension: {len(embedding)}")
+            return embedding
 
-            if response.status_code == 200:
-                result = response.json()
-                chunks = result.get("chunks", [])
-
-                # Filter by collection and other filters
-                filtered_chunks = []
-                for chunk in chunks:
-                    metadata = chunk.get("metadata", {})
-
-                    # Check collection
-                    if metadata.get("collection") != collection:
-                        continue
-
-                    # Check filters
-                    if filters:
-                        match = True
-                        for key, value in filters.items():
-                            if metadata.get(key) != value:
-                                match = False
-                                break
-                        if not match:
-                            continue
-
-                    filtered_chunks.append({
-                        "id": metadata.get("id"),
-                        "text": chunk.get("content", ""),
-                        "score": chunk.get("score", 0.0),
-                        "metadata": metadata
-                    })
-
-                return filtered_chunks[:top_k]
-            else:
-                logger.error(f"LlamaStack vector search error: {response.status_code} - {response.text}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Vector search failed: {response.status_code}"
-                )
-
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Embedding API HTTP error: {e.response.status_code} - {e.response.text}")
+        raise
+    except httpx.ConnectError as e:
+        logger.error(f"Embedding API connection error: {e}")
+        raise
+    except httpx.TimeoutException as e:
+        logger.error(f"Embedding API timeout: {e}")
+        raise
     except Exception as e:
-        logger.error(f"Error calling LlamaStack vector search: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Vector search error: {str(e)}")
+        logger.error(f"Error creating embedding: {str(e)}")
+        raise
 
 
-async def synthesize_with_llm(query: str, context: List[Dict[str, Any]]) -> str:
-    """Synthesize answer from retrieved context using LlamaStack."""
+# =============================================================================
+# MCP Tools
+# =============================================================================
+
+@mcp.tool()
+async def retrieve_user_info(
+    user_id: str,
+    query: str = "",
+    top_k: int = 5
+) -> str:
+    """
+    Retrieve user information and insurance contracts using vector search.
+
+    This tool performs ONLY retrieval. No LLM synthesis.
+    The LlamaStack agent will analyze the retrieved contracts.
+
+    Args:
+        user_id: User identifier
+        query: Search query for contracts (optional, used for similarity ranking)
+        top_k: Number of contracts to retrieve (default: 5)
+
+    Returns:
+        JSON string with user info and contracts
+    """
+    logger.info(f"Retrieving user info for: {user_id}")
+
+    # Input validation
+    if not user_id or not user_id.strip():
+        return json.dumps({
+            "success": False,
+            "error": "user_id is required"
+        })
+    
+    user_id = user_id.strip()
+    top_k = min(max(1, top_k), 50)  # Clamp between 1 and 50
+
     try:
-        # Prepare context text
-        context_text = "\n\n".join([
-            f"Document {i+1} (Title: {doc.get('title', 'N/A')}):\n{doc.get('content', '')[:500]}"
-            for i, doc in enumerate(context[:5])
-        ])
+        # Get user basic info
+        user_query = text("""
+            SELECT id, user_id, email, full_name, date_of_birth, phone_number, address
+            FROM users
+            WHERE user_id = :user_id
+        """)
+        user_result = await run_db_query_one(user_query, {"user_id": user_id})
 
-        # Use centralized prompt
-        prompt = get_knowledge_base_synthesis_prompt(query, context_text)
+        if not user_result:
+            logger.warning(f"User not found: {user_id}")
+            return json.dumps({
+                "success": False,
+                "error": f"User not found: {user_id}"
+            })
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{LLAMASTACK_ENDPOINT}/inference/generate",
-                json={
-                    "model": "llama-instruct-32-3b",
-                    "prompt": prompt,
-                    "temperature": 0.3,
-                    "max_tokens": 512,
+        user_info = dict(user_result._mapping)
+        
+        # Convert non-serializable types
+        for key, value in user_info.items():
+            if hasattr(value, 'isoformat'):  # datetime/date objects
+                user_info[key] = value.isoformat()
+
+        # Create embedding for query if provided
+        query_embedding = None
+        if query and query.strip():
+            try:
+                query_embedding = await create_embedding(query.strip())
+            except Exception as e:
+                logger.warning(f"Failed to create query embedding, falling back to simple fetch: {e}")
+
+        # Get user contracts
+        if query_embedding:
+            embedding_str = format_embedding(query_embedding)
+
+            contract_query = text("""
+                SELECT
+                    id, contract_number, contract_type, coverage_amount,
+                    full_text, key_terms, is_active,
+                    COALESCE(1 - (embedding <=> CAST(:query_embedding AS vector)), 0.0) AS similarity
+                FROM user_contracts
+                WHERE user_id = :user_id AND is_active = true
+                    AND embedding IS NOT NULL
+                ORDER BY COALESCE(embedding <=> CAST(:query_embedding AS vector), 999999)
+                LIMIT :top_k
+            """)
+
+            contract_results = await run_db_query(
+                contract_query,
+                {
+                    "user_id": user_id,
+                    "query_embedding": embedding_str,
+                    "top_k": top_k
                 }
             )
+        else:
+            # Simple fetch without similarity
+            contract_query = text("""
+                SELECT
+                    id, contract_number, contract_type, coverage_amount,
+                    full_text, key_terms, is_active,
+                    0.0 AS similarity
+                FROM user_contracts
+                WHERE user_id = :user_id AND is_active = true
+                LIMIT :top_k
+            """)
 
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get("generated_text", "Unable to generate answer.")
-                return answer
-            else:
-                return "Unable to synthesize answer from knowledge base."
-
-    except Exception as e:
-        logger.error(f"Error synthesizing answer: {str(e)}")
-        return f"Error: {str(e)}"
-
-
-# API Endpoints
-@app.post("/retrieve_user_info", response_model=RetrieveUserInfoResponse)
-async def retrieve_user_info(request: RetrieveUserInfoRequest) -> RetrieveUserInfoResponse:
-    """
-    Retrieve user information and contracts using LlamaStack vector search.
-
-    MCP Tool: retrieve_user_info
-    """
-    # ============== TIMING START ==============
-    start_time = time.time()
-    logger.info(f"⏱️  RAG RETRIEVE_USER_INFO STARTED for user: {request.user_id}")
-
-    try:
-        # Search user contracts via LlamaStack
-        search_start = time.time()
-        results = await vector_search_llamastack(
-            query=request.query,
-            collection="user_contracts",
-            top_k=request.top_k,
-            filters={"user_id": request.user_id, "is_active": True}
-        )
-        search_time = time.time() - search_start
-        logger.info(f"⏱️  Vector search completed in {search_time:.2f}s ({len(results)} results)")
+            contract_results = await run_db_query(
+                contract_query,
+                {"user_id": user_id, "top_k": top_k}
+            )
 
         contracts = []
-        similarity_scores = []
-        source_documents = []
+        for row in contract_results:
+            contract = dict(row._mapping)
+            # Convert Decimal to float for JSON serialization
+            if 'coverage_amount' in contract and contract['coverage_amount'] is not None:
+                contract['coverage_amount'] = float(contract['coverage_amount'])
+            if 'similarity' in contract and contract['similarity'] is not None:
+                contract['similarity'] = float(contract['similarity'])
+            contracts.append(contract)
 
-        for result in results:
-            metadata = result.get("metadata", {})
-            contracts.append({
-                "id": result.get("id"),
-                "contract_number": metadata.get("contract_number"),
-                "contract_type": metadata.get("contract_type"),
-                "coverage_amount": metadata.get("coverage_amount"),
-                "is_active": metadata.get("is_active"),
-            })
-            similarity_scores.append(result.get("score", 0.0))
-            source_documents.append(metadata.get("contract_number", ""))
+        logger.info(f"Retrieved {len(contracts)} contracts for user {user_id}")
 
-        # Get basic user info (could also be via vector search or direct DB)
-        user_info = {
-            "user_id": request.user_id,
-            # Add more user info if available
-        }
+        return json.dumps({
+            "success": True,
+            "user_info": user_info,
+            "contracts": contracts,
+            "total_contracts": len(contracts)
+        }, default=str)  # default=str handles any remaining non-serializable types
 
-        # ============== TIMING END ==============
-        total_time = time.time() - start_time
-        logger.info(f"⏱️  RAG RETRIEVE_USER_INFO COMPLETED in {total_time:.2f}s for user {request.user_id} ({len(contracts)} contracts)")
-
-        # Check if we exceeded 10s timeout threshold
-        if total_time > 10.0:
-            logger.warning(f"⚠️  RAG TOO SLOW: {total_time:.2f}s > 10s LlamaStack timeout!")
-
-        return RetrieveUserInfoResponse(
-            user_info=user_info,
-            contracts=contracts,
-            similarity_scores=similarity_scores,
-            source_documents=source_documents
-        )
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error retrieving user info: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error retrieving user info: {str(e)}", exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
 
 
-@app.post("/retrieve_similar_claims", response_model=RetrieveSimilarClaimsResponse)
-async def retrieve_similar_claims(request: RetrieveSimilarClaimsRequest) -> RetrieveSimilarClaimsResponse:
+@mcp.tool()
+async def retrieve_similar_claims(
+    claim_text: str,
+    claim_type: Optional[str] = None,
+    top_k: int = 10,
+    min_similarity: float = 0.7
+) -> str:
     """
-    Find similar historical claims using LlamaStack vector search.
+    Find similar historical claims using vector similarity search.
 
-    MCP Tool: retrieve_similar_claims
+    This tool performs ONLY retrieval. No LLM analysis.
+    The LlamaStack agent will analyze the similar claims patterns.
+
+    Args:
+        claim_text: Text of the current claim
+        claim_type: Optional filter by claim type
+        top_k: Number of similar claims to retrieve (default: 10)
+        min_similarity: Minimum similarity score 0.0-1.0 (default: 0.7)
+
+    Returns:
+        JSON string with similar claims
     """
-    # ============== TIMING START ==============
-    start_time = time.time()
-    logger.info(f"⏱️  RAG RETRIEVE_SIMILAR_CLAIMS STARTED (type: {request.claim_type}, top_k: {request.top_k})")
+    logger.info(f"Searching for similar claims (top_k={top_k}, min_similarity={min_similarity})")
+
+    # Input validation
+    if not claim_text or not claim_text.strip():
+        return json.dumps({
+            "success": False,
+            "error": "claim_text is required"
+        })
+    
+    claim_text = claim_text.strip()
+    top_k = min(max(1, top_k), 100)  # Clamp between 1 and 100
+    min_similarity = min(max(0.0, min_similarity), 1.0)  # Clamp between 0 and 1
 
     try:
-        # Search similar claims via LlamaStack
-        filters = {}
-        if request.claim_type:
-            filters["claim_type"] = request.claim_type
-        filters["status"] = {"$in": ["completed", "manual_review"]}
+        # Create embedding for claim text
+        claim_embedding = await create_embedding(claim_text)
+        embedding_str = format_embedding(claim_embedding)
 
-        search_start = time.time()
-        results = await vector_search_llamastack(
-            query=request.claim_text,
-            collection="claim_documents",
-            top_k=request.top_k,
-            filters=filters
+        # Vector search on claim documents
+        query = text("""
+            SELECT
+                CAST(c.id AS text) as claim_id,
+                c.claim_number,
+                cd.raw_ocr_text as claim_text,
+                1 - (cd.embedding <=> CAST(:claim_embedding AS vector)) AS similarity,
+                c.status as outcome,
+                c.total_processing_time_ms
+            FROM claim_documents cd
+            JOIN claims c ON cd.claim_id = c.id
+            WHERE 1 - (cd.embedding <=> CAST(:claim_embedding AS vector)) >= :min_similarity
+                AND (:claim_type IS NULL OR c.claim_type = :claim_type)
+                AND c.status IN ('completed', 'manual_review')
+                AND cd.embedding IS NOT NULL
+            ORDER BY cd.embedding <=> CAST(:claim_embedding AS vector)
+            LIMIT :top_k
+        """)
+
+        results = await run_db_query(
+            query,
+            {
+                "claim_embedding": embedding_str,
+                "min_similarity": min_similarity,
+                "claim_type": claim_type,
+                "top_k": top_k
+            }
         )
-        search_time = time.time() - search_start
-        logger.info(f"⏱️  Vector search completed in {search_time:.2f}s ({len(results)} results)")
 
         similar_claims = []
-        for result in results:
-            similarity = result.get("score", 0.0)
-            if similarity >= request.min_similarity:
-                metadata = result.get("metadata", {})
-                similar_claims.append(SimilarClaim(
-                    claim_id=result.get("id", ""),
-                    claim_number=metadata.get("claim_number", ""),
-                    claim_text=result.get("text", "")[:500],  # Truncate
-                    similarity_score=similarity,
-                    outcome=metadata.get("status"),
-                    processing_time=metadata.get("processing_time_ms")
-                ))
+        for row in results:
+            claim_text_truncated = ""
+            if row.claim_text:
+                claim_text_truncated = row.claim_text[:500]
+                if len(row.claim_text) > 500:
+                    claim_text_truncated += "..."
+            
+            similar_claims.append({
+                "claim_id": row.claim_id,
+                "claim_number": row.claim_number,
+                "claim_text": claim_text_truncated,
+                "similarity_score": float(row.similarity) if row.similarity else 0.0,
+                "outcome": row.outcome,
+                "processing_time_ms": row.total_processing_time_ms
+            })
 
-        # ============== TIMING END ==============
-        total_time = time.time() - start_time
-        logger.info(f"⏱️  RAG RETRIEVE_SIMILAR_CLAIMS COMPLETED in {total_time:.2f}s ({len(similar_claims)} similar claims found)")
+        logger.info(f"Found {len(similar_claims)} similar claims")
 
-        # Check if we exceeded 10s timeout threshold
-        if total_time > 10.0:
-            logger.warning(f"⚠️  RAG TOO SLOW: {total_time:.2f}s > 10s LlamaStack timeout!")
+        return json.dumps({
+            "success": True,
+            "similar_claims": similar_claims,
+            "total_found": len(similar_claims),
+            "search_params": {
+                "top_k": top_k,
+                "min_similarity": min_similarity,
+                "claim_type": claim_type
+            }
+        })
 
-        return RetrieveSimilarClaimsResponse(similar_claims=similar_claims)
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error retrieving similar claims: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error retrieving similar claims: {str(e)}", exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
 
 
-@app.post("/search_knowledge_base", response_model=SearchKnowledgeBaseResponse)
-async def search_knowledge_base(request: SearchKnowledgeBaseRequest) -> SearchKnowledgeBaseResponse:
+@mcp.tool()
+async def search_knowledge_base(
+    query: str,
+    top_k: int = 5,
+    category: Optional[str] = None
+) -> str:
     """
-    Search the knowledge base using LlamaStack vector search.
+    Search the knowledge base for relevant policy information.
 
-    MCP Tool: search_knowledge_base
+    This tool performs ONLY retrieval. No LLM synthesis.
+    The LlamaStack agent will synthesize answers from the retrieved documents.
+
+    Args:
+        query: Search query
+        top_k: Number of results to retrieve (default: 5)
+        category: Optional category filter
+
+    Returns:
+        JSON string with knowledge base articles
     """
+    logger.info(f"Searching knowledge base: {query}")
+
+    # Input validation
+    if not query or not query.strip():
+        return json.dumps({
+            "success": False,
+            "error": "query is required"
+        })
+    
+    query = query.strip()
+    top_k = min(max(1, top_k), 50)  # Clamp between 1 and 50
+
     try:
-        # Search knowledge base via LlamaStack
-        results = await vector_search_llamastack(
-            query=request.query,
-            collection="knowledge_base",
-            top_k=request.top_k,
-            filters={"is_active": True}
+        # Create embedding for query
+        query_embedding = await create_embedding(query)
+        embedding_str = format_embedding(query_embedding)
+
+        # Vector search on knowledge base
+        kb_query = text("""
+            SELECT
+                CAST(id AS text) as id,
+                title,
+                content,
+                category,
+                1 - (embedding <=> CAST(:query_embedding AS vector)) AS similarity
+            FROM knowledge_base
+            WHERE is_active = true
+                AND embedding IS NOT NULL
+                AND (:category IS NULL OR category = :category)
+            ORDER BY embedding <=> CAST(:query_embedding AS vector)
+            LIMIT :top_k
+        """)
+
+        results = await run_db_query(
+            kb_query,
+            {
+                "query_embedding": embedding_str,
+                "top_k": top_k,
+                "category": category
+            }
         )
 
         kb_results = []
-        for result in results:
-            metadata = result.get("metadata", {})
-            kb_results.append(KnowledgeBaseResult(
-                id=result.get("id", ""),
-                title=metadata.get("title", ""),
-                content=result.get("text", ""),
-                category=metadata.get("category"),
-                similarity_score=result.get("score", 0.0)
-            ))
+        for row in results:
+            kb_results.append({
+                "id": row.id,
+                "title": row.title,
+                "content": row.content,
+                "category": row.category,
+                "similarity_score": float(row.similarity) if row.similarity else 0.0
+            })
 
-        # Synthesize answer from retrieved documents
-        context = [{"title": r.title, "content": r.content} for r in kb_results]
-        synthesized_answer = await synthesize_with_llm(request.query, context)
+        logger.info(f"Found {len(kb_results)} knowledge base articles")
 
-        logger.info(f"Found {len(kb_results)} knowledge base articles via LlamaStack")
+        return json.dumps({
+            "success": True,
+            "articles": kb_results,
+            "total_found": len(kb_results),
+            "search_params": {
+                "query": query,
+                "top_k": top_k,
+                "category": category
+            }
+        })
 
-        return SearchKnowledgeBaseResponse(
-            results=kb_results,
-            synthesized_answer=synthesized_answer
-        )
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error searching knowledge base: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error searching knowledge base: {str(e)}", exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
 
 
-@app.get("/health/live", response_model=HealthResponse)
-async def liveness():
-    """Liveness probe."""
-    return HealthResponse(
-        status="alive",
-        service="mcp-rag-server-llamastack"
-    )
+# =============================================================================
+# Health Check Endpoint (optional but recommended)
+# =============================================================================
 
-
-@app.get("/health/ready", response_model=HealthResponse)
-async def readiness():
-    """Readiness probe."""
-    try:
-        # Check if LlamaStack is accessible
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{LLAMASTACK_ENDPOINT}/health")
-            if response.status_code == 200:
-                return HealthResponse(
-                    status="ready",
-                    service="mcp-rag-server-llamastack"
-                )
-            else:
-                raise HTTPException(status_code=503, detail="LlamaStack not ready")
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"LlamaStack not ready: {str(e)}")
-
-
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "service": "MCP RAG Server (LlamaStack-based)",
-        "version": "2.0.0",
-        "status": "running",
-        "centralized": "All operations via LlamaStack",
-        "tools": ["retrieve_user_info", "retrieve_similar_claims", "search_knowledge_base"]
+@mcp.tool()
+async def health_check() -> str:
+    """
+    Check server health and connectivity.
+    
+    Returns:
+        JSON string with health status
+    """
+    health = {
+        "status": "healthy",
+        "checks": {}
     }
+    
+    # Check database
+    try:
+        await run_db_query_one(text("SELECT 1"), {})
+        health["checks"]["database"] = "ok"
+    except Exception as e:
+        health["checks"]["database"] = f"error: {str(e)}"
+        health["status"] = "unhealthy"
+    
+    # Check embedding service
+    try:
+        await create_embedding("health check")
+        health["checks"]["embedding_service"] = "ok"
+    except Exception as e:
+        health["checks"]["embedding_service"] = f"error: {str(e)}"
+        health["status"] = "degraded"  # Can still work without embeddings for some queries
+    
+    return json.dumps(health)
 
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
 
+    # Verify database connection before starting
+    try:
+        check_database_connection()
+    except Exception as e:
+        logger.critical(f"Failed to connect to database: {e}")
+        logger.critical("Server cannot start without database connection")
+        exit(1)
+
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    logger.info(f"Starting MCP RAG Server (FastMCP) on {host}:{port}")
+    logger.info(f"SSE endpoint will be available at: http://{host}:{port}/sse")
+    logger.info(f"Embedding model: {EMBEDDING_MODEL}")
+    logger.info(f"LlamaStack endpoint: {LLAMASTACK_ENDPOINT}")
+    logger.info("Tools:")
+    logger.info("  - retrieve_user_info: Get user + contracts (vector search)")
+    logger.info("  - retrieve_similar_claims: Find similar claims (vector search)")
+    logger.info("  - search_knowledge_base: Search KB articles (vector search)")
+    logger.info("  - health_check: Check server health")
+
+    # Run FastMCP server with SSE transport
+    # SSE requires long-lived connections, so we configure uvicorn accordingly
+    uvicorn.run(
+        mcp.sse_app,
+        host=host,
+        port=port,
+        log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
+        # SSE-specific settings for persistent connections
+        timeout_keep_alive=300,      # Keep connection alive for 5 minutes
+        timeout_notify=30,           # Timeout for notifying the application
+        limit_concurrency=100,       # Maximum concurrent connections
+        limit_max_requests=None,     # No limit on requests per connection (important for SSE)
+        http="h11",                  # Use h11 HTTP implementation (better SSE support)
+        ws_max_size=16777216,        # 16MB max WebSocket message size
+        loop="asyncio",              # Explicitly use asyncio event loop
+    )

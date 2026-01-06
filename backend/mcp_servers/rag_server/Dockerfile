@@ -8,10 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy server code (only new LlamaStack-based server)
-COPY prompts.py .
+# Copy consolidated server code (all in server.py)
 COPY server.py .
-COPY mcp_server.py .
 
 # Create non-root user and fix permissions
 RUN useradd -m -u 1000 appuser && \
@@ -23,4 +21,4 @@ USER appuser
 EXPOSE 8080
 
 # Start MCP server with FastMCP SDK
-CMD ["python", "mcp_server.py"]
+CMD ["python", "server.py"]

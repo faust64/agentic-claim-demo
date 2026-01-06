@@ -25,10 +25,8 @@ COPY requirements.txt .
 RUN pip uninstall -y numpy || true
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy server code (only new qwen-vl based server)
-COPY prompts.py .
+# Copy consolidated server code (all in server.py)
 COPY server.py .
-COPY mcp_server.py .
 
 # Fix permissions for OpenShift
 RUN chgrp -R 0 /app && \
@@ -39,4 +37,4 @@ USER 1001
 EXPOSE 8080
 
 # Start MCP server with FastMCP SDK
-CMD ["python", "mcp_server.py"]
+CMD ["python", "server.py"]

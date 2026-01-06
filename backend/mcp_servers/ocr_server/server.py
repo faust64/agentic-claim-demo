@@ -1,92 +1,99 @@
 """
 MCP OCR Server - Extract text from documents using EasyOCR
+FastMCP implementation with SSE transport
 
-Performance improvement: Migrated from Qwen-VL 7B to EasyOCR for faster processing.
-- Qwen-VL: 30+ seconds per document (exceeded LlamaStack 30s timeout)
-- EasyOCR: 2-4 seconds per document (embedded library, no external service)
+SIMPLE TOOL: Returns raw OCR text only.
+The LlamaStack agent handles all LLM analysis and structuring.
+
+FIXES APPLIED:
+- Async execution of blocking OCR operations using asyncio.to_thread()
+- Secure temporary file handling with tempfile
+- Proper cleanup with try/finally
+- Input validation
+- Better error handling
 """
 
 import asyncio
+import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Tuple
 
 import easyocr
-import httpx
-from fastapi import FastAPI, HTTPException
-from PIL import Image
+from mcp.server.fastmcp import FastMCP
 from pdf2image import convert_from_path
-from pydantic import BaseModel, Field
-
-# Import prompts
-from prompts import get_ocr_validation_prompt
 
 # Configure logging
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# FastAPI app
-app = FastAPI(
-    title="MCP OCR Server",
-    description="OCR processing with EasyOCR (fast, embedded)",
-    version="3.0.0",
-)
+# Create FastMCP server
+mcp = FastMCP("ocr-server")
 
 # Configuration
-LLAMASTACK_ENDPOINT = os.getenv("LLAMASTACK_ENDPOINT", "http://localhost:8090")
 OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "en,fr").split(",")
+OCR_GPU_ENABLED = os.getenv("OCR_GPU_ENABLED", "false").lower() == "true"
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "50"))
+PDF_DPI = int(os.getenv("PDF_DPI", "200"))
+
+# Supported file extensions
+SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.webp'}
+SUPPORTED_PDF_EXTENSIONS = {'.pdf'}
+SUPPORTED_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS | SUPPORTED_PDF_EXTENSIONS
 
 # Initialize EasyOCR reader (lazy loading on first use)
 _ocr_reader = None
+_ocr_reader_lock = asyncio.Lock()
 
-def get_ocr_reader():
-    """Get or create EasyOCR reader instance (singleton)."""
+
+async def get_ocr_reader() -> easyocr.Reader:
+    """
+    Get or create EasyOCR reader instance (singleton with async lock).
+    
+    Returns:
+        EasyOCR Reader instance
+    """
     global _ocr_reader
-    if _ocr_reader is None:
-        logger.info(f"Initializing EasyOCR reader with languages: {OCR_LANGUAGES}")
-        _ocr_reader = easyocr.Reader(OCR_LANGUAGES, gpu=True)  # Use GPU if available
-        logger.info("EasyOCR reader initialized successfully")
-    return _ocr_reader
+    
+    async with _ocr_reader_lock:
+        if _ocr_reader is None:
+            logger.info(f"Initializing EasyOCR reader with languages: {OCR_LANGUAGES}")
+            logger.info(f"GPU enabled: {OCR_GPU_ENABLED}")
+            
+            # Initialize in thread pool (blocking operation)
+            _ocr_reader = await asyncio.to_thread(
+                easyocr.Reader,
+                OCR_LANGUAGES,
+                gpu=OCR_GPU_ENABLED
+            )
+            
+            logger.info("✅ EasyOCR reader initialized successfully")
+        
+        return _ocr_reader
 
 
-# Pydantic models
-class OCRRequest(BaseModel):
-    document_path: str = Field(..., description="Path to document image or PDF")
-    document_type: str = Field(default="claim_form", description="Type of document")
-    language: str = Field(default="eng", description="OCR language code")
-
-
-class OCRResponse(BaseModel):
-    success: bool
-    raw_text: Optional[str] = None
-    structured_data: Optional[Dict[str, Any]] = None
-    confidence: Optional[float] = None
-    errors: list[str] = Field(default_factory=list)
-
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-
-
-# Helper functions
-async def extract_text_with_easyocr(image_path: Path) -> tuple[str, float]:
+async def extract_text_with_easyocr(image_path: Path) -> Tuple[str, float]:
     """
     Extract text from image using EasyOCR.
-
-    EasyOCR is a lightweight, fast OCR library that supports 80+ languages.
-    It runs locally (no external API calls) and is much faster than Qwen-VL.
+    
+    Args:
+        image_path: Path to the image file
+        
+    Returns:
+        Tuple of (extracted_text, average_confidence)
     """
     try:
-        reader = get_ocr_reader()
+        reader = await get_ocr_reader()
 
-        # Run OCR on the image
-        # readtext returns list of (bbox, text, confidence) tuples
-        result = reader.readtext(str(image_path))
+        # Run OCR in thread pool (blocking operation)
+        result = await asyncio.to_thread(reader.readtext, str(image_path))
 
-        # Extract text and confidence
         if not result:
             logger.warning(f"No text detected in {image_path.name}")
             return "", 0.0
@@ -96,234 +103,312 @@ async def extract_text_with_easyocr(image_path: Path) -> tuple[str, float]:
         confidences = []
 
         for bbox, text, confidence in result:
-            text_blocks.append(text)
-            confidences.append(confidence)
+            if text.strip():  # Only include non-empty text
+                text_blocks.append(text.strip())
+                confidences.append(confidence)
 
-        # Join text blocks with spaces
         extracted_text = " ".join(text_blocks)
-
-        # Calculate average confidence
         avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
 
-        logger.info(f"Extracted text from {image_path.name} using EasyOCR (confidence: {avg_confidence:.2f})")
+        logger.info(f"Extracted {len(text_blocks)} text blocks from {image_path.name} (confidence: {avg_confidence:.2f})")
         return extracted_text.strip(), avg_confidence
 
     except Exception as e:
-        logger.error(f"Error extracting text with EasyOCR: {str(e)}")
+        logger.error(f"Error extracting text with EasyOCR from {image_path}: {str(e)}")
         raise
 
 
-async def extract_text_from_pdf(pdf_path: Path) -> tuple[str, float]:
-    """Extract text from PDF by converting to images and using EasyOCR."""
+async def extract_text_from_pdf(pdf_path: Path) -> Tuple[str, float]:
+    """
+    Extract text from PDF by converting to images and using EasyOCR.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        
+    Returns:
+        Tuple of (extracted_text, average_confidence)
+    """
+    temp_files = []  # Track temp files for cleanup
+    
     try:
-        # Convert PDF to images
-        images = convert_from_path(pdf_path, dpi=200)  # 200 DPI for good quality + speed
+        # Convert PDF to images in thread pool (blocking operation)
+        logger.info(f"Converting PDF to images: {pdf_path.name}")
+        images = await asyncio.to_thread(
+            convert_from_path,
+            pdf_path,
+            dpi=PDF_DPI,
+            first_page=1,
+            last_page=MAX_PDF_PAGES
+        )
+        
+        logger.info(f"PDF converted to {len(images)} pages")
 
         all_text = []
         all_confidences = []
 
         for i, image in enumerate(images):
-            # Save image temporarily for EasyOCR
-            temp_image_path = Path(f"/tmp/page_{i}.jpg")
-            image.save(temp_image_path, "JPEG", quality=90)
+            # Create secure temporary file
+            with tempfile.NamedTemporaryFile(
+                suffix=".jpg",
+                delete=False,
+                prefix=f"ocr_page_{i}_"
+            ) as tmp:
+                temp_image_path = Path(tmp.name)
+                temp_files.append(temp_image_path)
 
-            # Extract text from page using EasyOCR
-            text, confidence = await extract_text_with_easyocr(temp_image_path)
-            all_text.append(text)
-            all_confidences.append(confidence)
+            try:
+                # Save image to temp file
+                await asyncio.to_thread(
+                    image.save,
+                    temp_image_path,
+                    "JPEG",
+                    quality=90
+                )
 
-            # Clean up temp file
-            temp_image_path.unlink()
+                # Extract text from page
+                text, confidence = await extract_text_with_easyocr(temp_image_path)
+                
+                if text:  # Only include pages with detected text
+                    all_text.append(f"[Page {i + 1}]\n{text}")
+                    all_confidences.append(confidence)
+                else:
+                    all_text.append(f"[Page {i + 1}]\n(No text detected)")
+                    
+            finally:
+                # Clean up temp file immediately after processing
+                try:
+                    temp_image_path.unlink(missing_ok=True)
+                    temp_files.remove(temp_image_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file {temp_image_path}: {e}")
 
-        # Combine all pages
         combined_text = "\n\n--- Page Break ---\n\n".join(all_text)
         avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
-        logger.info(f"Extracted text from PDF with {len(images)} pages using EasyOCR, confidence: {avg_confidence:.2f}")
+        logger.info(f"Extracted text from PDF ({len(images)} pages, confidence: {avg_confidence:.2f})")
         return combined_text, avg_confidence
 
     except Exception as e:
-        logger.error(f"Error extracting text from PDF: {str(e)}")
+        logger.error(f"Error extracting text from PDF {pdf_path}: {str(e)}")
         raise
+        
+    finally:
+        # Cleanup any remaining temp files
+        for temp_file in temp_files:
+            try:
+                temp_file.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp file {temp_file}: {e}")
 
 
-async def validate_with_llm(raw_text: str, document_type: str) -> Dict[str, Any]:
-    """Validate and structure OCR text using LLM."""
-    try:
-        # Define expected fields based on document type
-        field_mapping = {
-            "claim_form": ["claim_number", "claimant_name", "date_of_service", "provider_name", "diagnosis", "amount"],
-            "invoice": ["invoice_number", "date", "vendor_name", "total_amount", "line_items"],
-            "medical_record": ["patient_name", "date_of_birth", "diagnosis", "treatment", "provider"],
-            "id_card": ["name", "id_number", "date_of_birth", "address"],
-            "other": ["key_information"]
-        }
-
-        expected_fields = field_mapping.get(document_type, field_mapping["other"])
-
-        # Prepare LLM prompt
-        prompt = get_ocr_validation_prompt(raw_text, expected_fields)
-
-        # Call LlamaStack
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{LLAMASTACK_ENDPOINT}/inference/generate",
-                json={
-                    "model": "llama-instruct-32-3b",
-                    "prompt": prompt,
-                    "temperature": 0.1,
-                    "max_tokens": 1024,
-                }
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                # Parse the generated text as JSON
-                import json
-                try:
-                    structured_data = json.loads(result.get("generated_text", "{}"))
-                    logger.info("Successfully validated OCR text with LLM")
-                    return structured_data
-                except json.JSONDecodeError:
-                    logger.warning("LLM response was not valid JSON, returning raw text")
-                    return {
-                        "fields": {"raw_text": {"value": raw_text, "confidence": 0.8}},
-                        "overall_confidence": 0.8,
-                        "requires_manual_review": True,
-                        "notes": "LLM validation failed to parse"
-                    }
-            else:
-                logger.error(f"LlamaStack API error: {response.status_code}")
-                return {
-                    "fields": {"raw_text": {"value": raw_text, "confidence": 0.7}},
-                    "overall_confidence": 0.7,
-                    "requires_manual_review": True,
-                    "notes": "LLM validation unavailable"
-                }
-
-    except Exception as e:
-        logger.error(f"Error validating with LLM: {str(e)}")
-        return {
-            "fields": {"raw_text": {"value": raw_text, "confidence": 0.7}},
-            "overall_confidence": 0.7,
-            "requires_manual_review": True,
-            "notes": f"Error: {str(e)}"
-        }
-
-
-# API Endpoints
-@app.post("/ocr_document", response_model=OCRResponse)
-async def ocr_document(request: OCRRequest) -> OCRResponse:
+def validate_file_path(document_path: str) -> Tuple[bool, str, Path]:
     """
-    Extract text from a document using EasyOCR.
-
-    MCP Tool: ocr_document
-
-    Performance: 2-4 seconds per document (much faster than Qwen-VL's 30+ seconds)
+    Validate the document path.
+    
+    Args:
+        document_path: Path to validate
+        
+    Returns:
+        Tuple of (is_valid, error_message, Path object)
     """
-    # ============== TIMING START ==============
+    if not document_path or not document_path.strip():
+        return False, "Document path is required", Path()
+    
+    doc_path = Path(document_path.strip())
+    
+    if not doc_path.exists():
+        return False, f"Document not found: {document_path}", doc_path
+    
+    if not doc_path.is_file():
+        return False, f"Path is not a file: {document_path}", doc_path
+    
+    file_extension = doc_path.suffix.lower()
+    if file_extension not in SUPPORTED_EXTENSIONS:
+        return False, f"Unsupported file type: {file_extension}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}", doc_path
+    
+    # Check file size (max 100MB)
+    max_size = 100 * 1024 * 1024  # 100MB
+    if doc_path.stat().st_size > max_size:
+        return False, f"File too large. Maximum size: 100MB", doc_path
+    
+    return True, "", doc_path
+
+
+@mcp.tool()
+async def ocr_document(
+    document_path: str,
+    language: str = "eng"
+) -> str:
+    """
+    Extract raw text from document using OCR (EasyOCR).
+
+    This tool performs ONLY text extraction. No LLM analysis or structuring.
+    The LlamaStack agent will analyze and structure the extracted text.
+
+    Supports PDF, JPG, PNG, TIFF, BMP, and WebP formats.
+    Fast extraction: 2-4 seconds per page.
+
+    Args:
+        document_path: Path to the document file (PDF, image, etc.)
+        language: OCR language code (eng, fra, deu, etc.)
+                 Note: Language is configured at server startup via OCR_LANGUAGES env var
+
+    Returns:
+        JSON string with raw extracted text and confidence score
+    """
     start_time = time.time()
-    logger.info(f"⏱️  OCR STARTED for document: {request.document_path}")
+    logger.info(f"⏱️  OCR STARTED for document: {document_path}")
+
+    # Validate input
+    is_valid, error_msg, doc_path = validate_file_path(document_path)
+    if not is_valid:
+        logger.error(error_msg)
+        return json.dumps({
+            "success": False,
+            "raw_text": None,
+            "confidence": 0.0,
+            "error": error_msg
+        })
 
     try:
-        document_path = Path(request.document_path)
+        file_extension = doc_path.suffix.lower()
 
-        # Check if file exists
-        if not document_path.exists():
-            logger.error(f"Document not found: {request.document_path}")
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document not found: {request.document_path}"
-            )
-
-        # Determine file type and extract text
-        file_extension = document_path.suffix.lower()
-
-        # ============== TIMING: OCR Extraction ==============
-        extraction_start = time.time()
-        if file_extension in ['.pdf']:
-            raw_text, confidence = await extract_text_from_pdf(document_path)
-        elif file_extension in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:
-            raw_text, confidence = await extract_text_with_easyocr(document_path)
+        # Extract text based on file type
+        if file_extension in SUPPORTED_PDF_EXTENSIONS:
+            raw_text, confidence = await extract_text_from_pdf(doc_path)
+        elif file_extension in SUPPORTED_IMAGE_EXTENSIONS:
+            raw_text, confidence = await extract_text_with_easyocr(doc_path)
         else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type: {file_extension}"
-            )
-        extraction_time = time.time() - extraction_start
-        logger.info(f"⏱️  OCR Extraction completed in {extraction_time:.2f}s (confidence: {confidence:.2f})")
+            # This shouldn't happen due to validation, but just in case
+            return json.dumps({
+                "success": False,
+                "raw_text": None,
+                "confidence": 0.0,
+                "error": f"Unsupported file type: {file_extension}"
+            })
 
-        # ============== TIMING: LLM Validation ==============
-        validation_start = time.time()
-        structured_data = await validate_with_llm(raw_text, request.document_type)
-        validation_time = time.time() - validation_start
-        logger.info(f"⏱️  LLM Validation completed in {validation_time:.2f}s")
-
-        # ============== TIMING END ==============
         total_time = time.time() - start_time
-        logger.info(f"⏱️  OCR COMPLETED in {total_time:.2f}s (Extraction: {extraction_time:.2f}s, Validation: {validation_time:.2f}s)")
+        logger.info(f"⏱️  OCR COMPLETED in {total_time:.2f}s (confidence: {confidence:.2f})")
 
-        # Check if we exceeded LlamaStack timeout threshold (30s)
         if total_time > 25.0:
-            logger.warning(f"⚠️  OCR approaching timeout: {total_time:.2f}s (LlamaStack timeout: 30s)")
+            logger.warning(f"⚠️  OCR took longer than expected: {total_time:.2f}s")
 
-        return OCRResponse(
-            success=True,
-            raw_text=raw_text,
-            structured_data=structured_data,
-            confidence=confidence,
-            errors=[]
-        )
+        # Calculate text statistics
+        word_count = len(raw_text.split()) if raw_text else 0
+        char_count = len(raw_text) if raw_text else 0
 
-    except HTTPException:
-        raise
+        return json.dumps({
+            "success": True,
+            "raw_text": raw_text,
+            "confidence": round(confidence, 4),
+            "processing_time_seconds": round(total_time, 2),
+            "statistics": {
+                "word_count": word_count,
+                "character_count": char_count
+            },
+            "file_info": {
+                "name": doc_path.name,
+                "extension": file_extension,
+                "size_bytes": doc_path.stat().st_size
+            }
+        })
+
     except Exception as e:
-        logger.error(f"Error processing OCR request: {str(e)}")
-        return OCRResponse(
-            success=False,
-            raw_text=None,
-            structured_data=None,
-            confidence=0.0,
-            errors=[str(e)]
-        )
+        total_time = time.time() - start_time
+        logger.error(f"Error processing OCR request after {total_time:.2f}s: {str(e)}", exc_info=True)
+        return json.dumps({
+            "success": False,
+            "raw_text": None,
+            "confidence": 0.0,
+            "error": str(e),
+            "processing_time_seconds": round(total_time, 2)
+        })
 
 
-@app.get("/health/live", response_model=HealthResponse)
-async def liveness():
-    """Liveness probe."""
-    return HealthResponse(status="alive", service="mcp-ocr-server-easyocr")
-
-
-@app.get("/health/ready", response_model=HealthResponse)
-async def readiness():
-    """Readiness probe - EasyOCR is embedded, always ready if server is alive."""
-    try:
-        # EasyOCR is embedded, just check if we can initialize it
-        reader = get_ocr_reader()
-        if reader:
-            return HealthResponse(status="ready", service="mcp-ocr-server-easyocr")
-        else:
-            raise HTTPException(status_code=503, detail="EasyOCR reader not initialized")
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"EasyOCR not ready: {str(e)}")
-
-
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "service": "MCP OCR Server (EasyOCR)",
-        "version": "3.0.0",
-        "status": "running",
-        "model": "easyocr",
-        "languages": OCR_LANGUAGES,
-        "tools": ["ocr_document"],
-        "performance": "2-4 seconds per document (vs 30+ seconds with Qwen-VL)"
+@mcp.tool()
+async def ocr_health_check() -> str:
+    """
+    Check OCR server health and readiness.
+    
+    Returns:
+        JSON string with health status
+    """
+    health = {
+        "status": "healthy",
+        "checks": {},
+        "config": {
+            "languages": OCR_LANGUAGES,
+            "gpu_enabled": OCR_GPU_ENABLED,
+            "max_pdf_pages": MAX_PDF_PAGES,
+            "pdf_dpi": PDF_DPI
+        }
     }
+    
+    # Check EasyOCR reader
+    try:
+        reader = await get_ocr_reader()
+        health["checks"]["easyocr"] = "ok"
+        health["checks"]["easyocr_languages"] = reader.lang_list
+    except Exception as e:
+        health["checks"]["easyocr"] = f"error: {str(e)}"
+        health["status"] = "unhealthy"
+    
+    # Check temp directory
+    try:
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            health["checks"]["temp_directory"] = "ok"
+    except Exception as e:
+        health["checks"]["temp_directory"] = f"error: {str(e)}"
+        health["status"] = "degraded"
+    
+    return json.dumps(health)
+
+
+@mcp.tool()
+async def list_supported_formats() -> str:
+    """
+    List all supported file formats for OCR.
+    
+    Returns:
+        JSON string with supported formats
+    """
+    return json.dumps({
+        "image_formats": sorted(list(SUPPORTED_IMAGE_EXTENSIONS)),
+        "document_formats": sorted(list(SUPPORTED_PDF_EXTENSIONS)),
+        "all_formats": sorted(list(SUPPORTED_EXTENSIONS)),
+        "languages": OCR_LANGUAGES
+    })
 
 
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    logger.info(f"Starting MCP OCR Server (FastMCP) on {host}:{port}")
+    logger.info(f"SSE endpoint will be available at: http://{host}:{port}/sse")
+    logger.info(f"OCR Languages: {OCR_LANGUAGES}")
+    logger.info(f"GPU Enabled: {OCR_GPU_ENABLED}")
+    logger.info(f"Max PDF Pages: {MAX_PDF_PAGES}")
+    logger.info("Tools:")
+    logger.info("  - ocr_document: Extract raw text from documents")
+    logger.info("  - ocr_health_check: Check server health")
+    logger.info("  - list_supported_formats: List supported file formats")
+
+    # Run FastMCP server with SSE transport
+    # SSE requires long-lived connections, so we configure uvicorn accordingly
+    uvicorn.run(
+        mcp.sse_app,
+        host=host,
+        port=port,
+        log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
+        # SSE-specific settings for persistent connections
+        timeout_keep_alive=300,      # Keep connection alive for 5 minutes
+        timeout_notify=30,           # Timeout for notifying the application
+        limit_concurrency=100,       # Maximum concurrent connections
+        limit_max_requests=None,     # No limit on requests per connection (important for SSE)
+        http="h11",                  # Use h11 HTTP implementation (better SSE support)
+        ws_max_size=16777216,        # 16MB max WebSocket message size
+        loop="asyncio",              # Explicitly use asyncio event loop
+    )
