@@ -38,6 +38,9 @@ spec:
         - "0.9"
         # Quantization (INT8/w8a8 already baked into model weights)
         - --dtype=auto
+        # FP8 KV cache quantization to reduce memory by 50% (model weights are INT8, but KV cache is separate)
+        - --kv-cache-dtype
+        - fp8
         # Context length (Llama 3.3 supports 128k, but we limit for memory)
         # Reduced to 20256 to fit KV cache in available GPU memory
         - --max-model-len
