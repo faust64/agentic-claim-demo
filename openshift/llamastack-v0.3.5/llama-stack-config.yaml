@@ -22,7 +22,7 @@ data:
       - provider_id: vllm-inference-1
         provider_type: remote::vllm
         config:
-          url: "http://llama-instruct-32-3b-predictor.edg-demo.svc.cluster.local:8000/v1"
+          url: "https://llama-instruct-32-3b-llama-instruct-32-3b-demo.apps.cluster-rk6mx.rk6mx.sandbox492.opentlc.com/v1"
 
     # MCP Tool Groups (CRITICAL for v0.3.5 - enables MCP tool execution)
     toolgroups:
@@ -38,11 +38,19 @@ data:
         mcp_endpoint:
           uri: "http://rag-server.claims-demo.svc.cluster.local:8080/sse"
 
-    # Agents runtime
+    # Agents runtime with PostgreSQL persistence
     agents:
       - provider_id: meta-reference
         provider_type: inline::meta-reference
-        config: {}
+        config:
+          persistence_store:
+            type: postgres
+            namespace: null
+            host: "postgresql.claims-demo.svc.cluster.local"
+            port: 5432
+            db: "claims_db"
+            user: "claims_user"
+            password: "${POSTGRES_PASSWORD}"
 
     # Vector DB for RAG (optional - if using builtin RAG)
     memory_banks:

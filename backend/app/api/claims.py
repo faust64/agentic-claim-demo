@@ -1,16 +1,31 @@
 """
 Claims API endpoints.
+
+Endpoints:
+- GET    /                        - List claims with pagination
+- GET    /{claim_id}              - Get a specific claim
+- POST   /                        - Create a new claim
+- POST   /{claim_id}/process      - Process a claim with LlamaStack agent
+- GET    /{claim_id}/status       - Get claim processing status
+- GET    /{claim_id}/decision     - Get claim decision
+- GET    /{claim_id}/logs         - Get processing logs
+- GET    /statistics/overview     - Get claims statistics
+- GET    /documents/{claim_id}/view - View claim document
 """
 
-import httpx
 import json
 import logging
+import os
+import re
 import time
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Optional
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
+from llama_stack_client import AsyncLlamaStackClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -19,11 +34,100 @@ from app.api import schemas
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import claim as models
+from app.llamastack.prompts import CLAIMS_PROCESSING_AGENT_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Constants
+LLAMASTACK_TIMEOUT = 300.0  # 5 minutes for agent operations
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def extract_json_from_text(text: str) -> Optional[dict]:
+    """Extract JSON object from text that may contain other content."""
+    if not text:
+        return None
+    
+    # Try direct parse first
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+    
+    # Try to find JSON object in text using regex
+    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+    matches = re.findall(json_pattern, text, re.DOTALL)
+    
+    for match in matches:
+        try:
+            return json.loads(match)
+        except json.JSONDecodeError:
+            continue
+    
+    # Try to find JSON between code blocks
+    code_block_pattern = r'```(?:json)?\s*(\{.*?\})\s*```'
+    code_matches = re.findall(code_block_pattern, text, re.DOTALL)
+    
+    for match in code_matches:
+        try:
+            return json.loads(match)
+        except json.JSONDecodeError:
+            continue
+    
+    return None
+
+
+def parse_agent_decision(response_text: str) -> dict:
+    """Parse agent response to extract decision data."""
+    json_data = extract_json_from_text(response_text)
+    
+    if json_data:
+        return {
+            "recommendation": json_data.get("recommendation", json_data.get("decision", "manual_review")),
+            "confidence": float(json_data.get("confidence", json_data.get("confidence_score", 0.5))),
+            "reasoning": json_data.get("reasoning", json_data.get("explanation", response_text)),
+            "relevant_policies": json_data.get("relevant_policies", json_data.get("policies", [])),
+            "estimated_coverage_amount": json_data.get("estimated_coverage_amount", json_data.get("coverage", None))
+        }
+    
+    # Fallback: infer decision from text
+    response_lower = response_text.lower()
+    
+    if "approve" in response_lower or "approved" in response_lower:
+        recommendation = "approve"
+        confidence = 0.6
+    elif "deny" in response_lower or "denied" in response_lower or "reject" in response_lower:
+        recommendation = "deny"
+        confidence = 0.6
+    else:
+        recommendation = "manual_review"
+        confidence = 0.5
+    
+    return {
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "reasoning": response_text,
+        "relevant_policies": [],
+        "estimated_coverage_amount": None
+    }
+
+
+async def create_llamastack_client() -> AsyncLlamaStackClient:
+    """Create configured LlamaStack async client."""
+    return AsyncLlamaStackClient(
+        base_url=settings.llamastack_endpoint,
+        timeout=LLAMASTACK_TIMEOUT
+    )
+
+
+# =============================================================================
+# GET / - List Claims
+# =============================================================================
 
 @router.get("/", response_model=schemas.ClaimListResponse)
 async def list_claims(
@@ -33,16 +137,11 @@ async def list_claims(
     user_id: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    List claims with pagination and optional filtering.
-    """
+    """List claims with pagination and optional filtering."""
     try:
-        # Build query
         query = select(models.Claim)
 
-        # Apply filters
         if status:
-            # Use string directly, SQLAlchemy will handle enum conversion
             query = query.where(models.Claim.status == status)
         if user_id:
             query = query.where(models.Claim.user_id == user_id)
@@ -52,14 +151,15 @@ async def list_claims(
         total_result = await db.execute(count_query)
         total = total_result.scalar()
 
-        # Apply pagination
+        # Apply pagination and ordering
         offset = (page - 1) * page_size
-        query = query.offset(offset).limit(page_size)
+        query = (
+            query
+            .order_by(models.Claim.submitted_at.desc())
+            .offset(offset)
+            .limit(page_size)
+        )
 
-        # Order by submission date
-        query = query.order_by(models.Claim.submitted_at.desc())
-
-        # Execute query
         result = await db.execute(query)
         claims = result.scalars().all()
 
@@ -71,18 +171,20 @@ async def list_claims(
         )
 
     except Exception as e:
-        logger.error(f"Error listing claims: {str(e)}")
+        logger.error(f"Error listing claims: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================================
+# GET /{claim_id} - Get Claim
+# =============================================================================
 
 @router.get("/{claim_id}", response_model=schemas.ClaimResponse)
 async def get_claim(
     claim_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Get a specific claim by ID.
-    """
+    """Get a specific claim by ID."""
     try:
         query = select(models.Claim).where(models.Claim.id == claim_id)
         result = await db.execute(query)
@@ -96,18 +198,20 @@ async def get_claim(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting claim: {str(e)}")
+        logger.error(f"Error getting claim: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================================
+# POST / - Create Claim
+# =============================================================================
 
 @router.post("/", response_model=schemas.ClaimResponse, status_code=201)
 async def create_claim(
     claim_data: schemas.ClaimCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Create a new claim.
-    """
+    """Create a new claim."""
     try:
         new_claim = models.Claim(**claim_data.model_dump())
         db.add(new_claim)
@@ -119,9 +223,13 @@ async def create_claim(
 
     except Exception as e:
         await db.rollback()
-        logger.error(f"Error creating claim: {str(e)}")
+        logger.error(f"Error creating claim: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================================
+# POST /{claim_id}/process - Process Claim with LlamaStack Agent
+# =============================================================================
 
 @router.post("/{claim_id}/process", response_model=schemas.ProcessClaimResponse)
 async def process_claim(
@@ -130,29 +238,21 @@ async def process_claim(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Start processing a claim using LlamaStack ReActAgent SDK.
-
-    The ReActAgent uses a Thought-Action-Observation loop to:
-    - Reason about the next step (Thought)
-    - Execute a tool if necessary (Action)
-    - Observe the result (Observation)
-    - Repeat until reaching the final answer
-
-    This version uses the llama-stack-client SDK with:
-    - LlamaStackClient
-    - Agent.create() with AgentConfig
-    - EventLogger for event logging
-
-    Note: For the HTTP Response API version (without SDK),
-    see branch 'http-response-api'
+    Process a claim using LlamaStack ReActAgent.
+    
+    The agent will:
+    1. Extract document info via OCR
+    2. Retrieve user contracts via RAG
+    3. Find similar historical claims
+    4. Make a decision (approve/deny/manual_review)
     """
-    import time
-    import json
-    import httpx
-    from app.llamastack.prompts import CLAIMS_PROCESSING_AGENT_INSTRUCTIONS
+    client = None
+    agent_id = None
+    session_id = None
+    start_time = time.time()
 
     try:
-        # Get the claim
+        # Step 1: Get and validate claim
         query = select(models.Claim).where(models.Claim.id == claim_id)
         result = await db.execute(query)
         claim = result.scalar_one_or_none()
@@ -160,27 +260,32 @@ async def process_claim(
         if not claim:
             raise HTTPException(status_code=404, detail="Claim not found")
 
+        if claim.status == models.ClaimStatus.processing:
+            raise HTTPException(status_code=409, detail="Claim is already being processed")
+
         # Update status to processing
         claim.status = models.ClaimStatus.processing
         await db.commit()
 
-        # Track processing start time
-        start_time = time.time()
+        # Store claim data for agent message
+        claim_user_id = claim.user_id
+        claim_document_path = claim.document_path
+        claim_type = getattr(claim, 'claim_type', 'general')
+        claim_submitted_at = claim.submitted_at
 
+        # Step 2: Create LlamaStack agent using HTTP API directly
         try:
-            # Build MCP toolgroups list
-            # Format: Array of toolgroup IDs (e.g., "mcp::rag-server")
-            # These must match the toolgroups registered in LlamaStack config
             toolgroups = []
             if not process_request.skip_ocr:
                 toolgroups.append("mcp::ocr-server")
             if process_request.enable_rag:
                 toolgroups.append("mcp::rag-server")
 
-            # Create Agent using HTTP API directly (v0.3.5+rhai0 format)
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=60.0) as http_client:
+                logger.info(f"Creating LlamaStack agent for claim {claim_id}...")
+
                 # Create agent
-                agent_response = await client.post(
+                agent_response = await http_client.post(
                     f"{settings.llamastack_endpoint}/v1/agents",
                     json={
                         "agent_config": {
@@ -192,10 +297,10 @@ async def process_claim(
                                 "tool_choice": "auto",
                                 "tool_prompt_format": "json"
                             },
-                            "max_infer_iters": 5,  # Reduced from 10 for faster processing
+                            "max_infer_iters": 8,  # Increased for sequential single-tool-per-turn execution
                             "sampling_params": {
                                 "strategy": {"type": "greedy"},
-                                "max_tokens": 1024  # Reduced from 2048 for faster generation
+                                "max_tokens": 2048
                             }
                         }
                     }
@@ -208,7 +313,7 @@ async def process_claim(
                 logger.info(f"Created agent: {agent_id}")
 
                 # Create session
-                session_response = await client.post(
+                session_response = await http_client.post(
                     f"{settings.llamastack_endpoint}/v1/agents/{agent_id}/session",
                     json={"session_name": f"claim_{claim_id}"}
                 )
@@ -219,14 +324,14 @@ async def process_claim(
                 session_id = session_response.json()["session_id"]
                 logger.info(f"Created session: {session_id}")
 
-                # Prepare user message
+                # Step 3: Execute agent
                 user_message = f"""
 Process this insurance claim:
 
 Claim ID: {claim_id}
-User ID: {claim.user_id}
-Document Path: {claim.document_path}
-Claim Type: {claim.claim_type if hasattr(claim, 'claim_type') else 'general'}
+User ID: {claim_user_id}
+Document Path: {claim_document_path}
+Claim Type: {claim_type}
 
 Please:
 1. Extract all information from the document using OCR
@@ -235,27 +340,33 @@ Please:
 4. Determine if the claim should be approved, denied, or requires manual review
 5. Provide detailed reasoning citing relevant policy sections
 
+Return your final decision as JSON:
+{{
+    "recommendation": "approve" | "deny" | "manual_review",
+    "confidence": 0.0-1.0,
+    "reasoning": "detailed explanation",
+    "relevant_policies": ["policy1", "policy2"],
+    "estimated_coverage_amount": 1234.56
+}}
+
 Workflow configuration:
 - Skip OCR: {process_request.skip_ocr}
 - Enable RAG retrieval: {process_request.enable_rag}
 """
 
-                # Execute agent turn (streaming mode)
                 logger.info("Starting agent execution...")
-
                 final_response = ""
                 tool_execution_count = 0
 
-                async with client.stream(
+                # Execute turn using HTTP streaming
+                async with http_client.stream(
                     "POST",
                     f"{settings.llamastack_endpoint}/v1/agents/{agent_id}/session/{session_id}/turn",
                     json={
-                        "messages": [
-                            {"role": "user", "content": user_message}
-                        ],
+                        "messages": [{"role": "user", "content": user_message}],
                         "stream": True
                     },
-                    timeout=180.0  # Increased from 120s to allow for complex processing
+                    timeout=180.0
                 ) as response:
                     if response.status_code != 200:
                         raise ValueError(f"Failed to execute turn: {response.text}")
@@ -267,129 +378,140 @@ Workflow configuration:
                         data = line[6:]  # Remove "data: " prefix
                         try:
                             event = json.loads(data)
-                            if isinstance(event, dict) and "event" in event:
-                                payload = event["event"].get("payload", {})
-                                event_type = payload.get("event_type")
-                                step_type = payload.get("step_type")
+                            if not isinstance(event, dict) or "event" not in event:
+                                continue
 
-                                # Log tool execution for monitoring
-                                if step_type == "tool_execution" and event_type == "step_complete":
+                            payload = event["event"].get("payload", {})
+                            step_type = payload.get("step_type")
+                            event_type = payload.get("event_type")
+
+                            if step_type == "tool_execution":
+                                if event_type == "step_start":
                                     tool_execution_count += 1
+                                    logger.info(f"Tool execution #{tool_execution_count} started")
+                                elif event_type == "step_complete":
                                     step_details = payload.get("step_details", {})
                                     tool_calls = step_details.get("tool_calls", [])
-                                    logger.info(f"Tool execution #{tool_execution_count}: {len(tool_calls)} tool(s)")
+                                    for tool_call in tool_calls:
+                                        logger.info(f"  Tool completed: {tool_call.get('tool_name')}")
 
-                                # Collect final inference output
-                                elif step_type == "inference" and event_type == "step_progress":
+                            elif step_type == "inference":
+                                if event_type == "step_progress":
                                     delta = payload.get("delta", {})
                                     if delta.get("type") == "text":
                                         final_response += delta.get("text", "")
+                                elif event_type == "step_complete":
+                                    step_details = payload.get("step_details", {})
+                                    final_response += step_details.get("text", "")
 
                         except json.JSONDecodeError:
-                            pass
+                            continue
 
-                logger.info(f"Agent execution completed. Tool executions: {tool_execution_count}")
+                logger.info(f"Agent completed. Tools used: {tool_execution_count}, Response: {len(final_response)} chars")
 
+                # Step 4: Parse response and update claim
                 if not final_response.strip():
-                    final_response = "The claim has been processed. Recommendation: manual_review"
+                    logger.warning("Empty response from agent")
+                    decision_data = {
+                        "recommendation": "manual_review",
+                        "confidence": 0.0,
+                        "reasoning": "Agent returned empty response"
+                    }
+                else:
+                    decision_data = parse_agent_decision(final_response)
 
-            # Parse the agent's decision
-            try:
-                decision_data = json.loads(final_response) if "{" in final_response else {
-                    "recommendation": "manual_review",
-                    "confidence": 0.5,
-                    "reasoning": final_response
-                }
-            except json.JSONDecodeError:
-                logger.warning("Could not parse agent response as JSON, using fallback")
-                decision_data = {
-                    "recommendation": "manual_review",
-                    "confidence": 0.5,
-                    "reasoning": final_response
-                }
+                processing_time_ms = int((time.time() - start_time) * 1000)
 
-            # Calculate processing time
-            processing_time_ms = int((time.time() - start_time) * 1000)
+                await db.refresh(claim)
 
-            # Store LlamaStack agent_id and session_id in claim metadata for later retrieval
-            if not claim.claim_metadata:
-                claim.claim_metadata = {}
-            claim.claim_metadata["llamastack_agent_id"] = agent_id
-            claim.claim_metadata["llamastack_session_id"] = session_id
-            flag_modified(claim, "claim_metadata")  # Mark JSON field as modified for SQLAlchemy
+                # Store metadata
+                if not claim.claim_metadata:
+                    claim.claim_metadata = {}
+                claim.claim_metadata["llamastack_agent_id"] = agent_id
+                claim.claim_metadata["llamastack_session_id"] = session_id
+                claim.claim_metadata["tool_execution_count"] = tool_execution_count
+                flag_modified(claim, "claim_metadata")
 
-            # Update claim based on recommendation
-            recommendation = decision_data.get("recommendation", "manual_review")
-            if recommendation == "approve":
-                claim.status = models.ClaimStatus.completed
-            elif recommendation == "deny":
-                claim.status = models.ClaimStatus.failed
-            else:  # manual_review
-                claim.status = models.ClaimStatus.manual_review
+                # Update status
+                recommendation = decision_data.get("recommendation", "manual_review")
+                if recommendation == "approve":
+                    claim.status = models.ClaimStatus.completed
+                elif recommendation == "deny":
+                    claim.status = models.ClaimStatus.failed
+                else:
+                    claim.status = models.ClaimStatus.manual_review
 
-            claim.total_processing_time_ms = processing_time_ms
-            claim.processed_at = datetime.utcnow()
+                claim.total_processing_time_ms = processing_time_ms
+                claim.processed_at = datetime.now(timezone.utc)
 
-            # Create decision record
-            decision = models.ClaimDecision(
-                claim_id=claim_id,
-                decision=recommendation,
-                confidence=decision_data.get("confidence", 0.0),
-                reasoning=decision_data.get("reasoning", ""),
-                relevant_policies={
-                    "policies": decision_data.get("relevant_policies", []),
-                    "estimated_coverage": decision_data.get("estimated_coverage_amount")
-                },
-                llm_model=settings.llamastack_default_model,
-                requires_manual_review=(recommendation == "manual_review")
-            )
-            db.add(decision)
+                # Create decision record
+                decision = models.ClaimDecision(
+                    claim_id=claim_id,
+                    decision=recommendation,
+                    confidence=decision_data.get("confidence", 0.0),
+                    reasoning=decision_data.get("reasoning", ""),
+                    relevant_policies={
+                        "policies": decision_data.get("relevant_policies", []),
+                        "estimated_coverage": decision_data.get("estimated_coverage_amount")
+                    },
+                    llm_model=settings.llamastack_default_model,
+                    requires_manual_review=(recommendation == "manual_review")
+                )
+                db.add(decision)
+                await db.commit()
 
-            await db.commit()
+                logger.info(f"Claim {claim_id} processed: {recommendation}")
 
-            logger.info(f"Claim {claim_id} processed via ReActAgent SDK: {recommendation}")
-            return schemas.ProcessClaimResponse(
-                claim_id=claim_id,
-                status=claim.status.value,
-                message=f"Processing completed: {recommendation}",
-                processing_started_at=claim.submitted_at
-            )
+                return schemas.ProcessClaimResponse(
+                    claim_id=claim_id,
+                    status=claim.status.value,
+                    message=f"Processing completed: {recommendation}",
+                    processing_started_at=claim_submitted_at
+                )
 
-        except httpx.HTTPError as e:
+        except httpx.ConnectError as e:
+            logger.error(f"Cannot connect to LlamaStack: {e}")
             claim.status = models.ClaimStatus.failed
             await db.commit()
-            logger.error(f"LlamaStack HTTP error: {str(e)}")
-            raise HTTPException(
-                status_code=503,
-                detail=f"Cannot connect to LlamaStack server: {str(e)}"
-            )
-        except ValueError as e:
-            claim.status = models.ClaimStatus.failed
-            await db.commit()
-            logger.error(f"LlamaStack API error: {str(e)}")
-            raise HTTPException(
-                status_code=503,
-                detail=f"LlamaStack API error: {str(e)}"
-            )
+            raise HTTPException(status_code=503, detail=f"Cannot connect to LlamaStack: {str(e)}")
+        except httpx.TimeoutException as e:
+            logger.error(f"LlamaStack request timed out: {e}")
+            raise HTTPException(status_code=504, detail="Agent processing timed out")
 
     except HTTPException:
         raise
     except Exception as e:
-        await db.rollback()
-        logger.error(f"Error processing claim: {str(e)}")
+        logger.error(f"Error processing claim {claim_id}: {str(e)}", exc_info=True)
+        try:
+            await db.rollback()
+            result = await db.execute(select(models.Claim).where(models.Claim.id == claim_id))
+            claim = result.scalar_one_or_none()
+            if claim:
+                claim.status = models.ClaimStatus.failed
+                await db.commit()
+        except Exception as db_error:
+            logger.error(f"Failed to update claim status: {db_error}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    finally:
+        if client:
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning(f"Error closing LlamaStack client: {e}")
+
+
+# =============================================================================
+# GET /{claim_id}/status - Get Claim Status
+# =============================================================================
 
 @router.get("/{claim_id}/status", response_model=schemas.ClaimStatusResponse)
 async def get_claim_status(
     claim_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Get the current processing status of a claim using LlamaStack traceability.
-    """
+    """Get the current processing status of a claim."""
     try:
-        # Get claim
         claim_query = select(models.Claim).where(models.Claim.id == claim_id)
         claim_result = await db.execute(claim_query)
         claim = claim_result.scalar_one_or_none()
@@ -397,7 +519,6 @@ async def get_claim_status(
         if not claim:
             raise HTTPException(status_code=404, detail="Claim not found")
 
-        # Get LlamaStack agent/session IDs from claim metadata
         agent_id = claim.claim_metadata.get("llamastack_agent_id") if claim.claim_metadata else None
         session_id = claim.claim_metadata.get("llamastack_session_id") if claim.claim_metadata else None
 
@@ -405,12 +526,11 @@ async def get_claim_status(
         current_step = None
         progress = 0.0
 
-        # If we have agent and session IDs, fetch history from LlamaStack
+        # Fetch LlamaStack session history if available
         if agent_id and session_id:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                try:
-                    # Get session history from LlamaStack
-                    response = await client.get(
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    response = await http_client.get(
                         f"{settings.llamastack_endpoint}/v1/agents/{agent_id}/session/{session_id}"
                     )
 
@@ -418,14 +538,12 @@ async def get_claim_status(
                         session_data = response.json()
                         turns = session_data.get("turns", [])
 
-                        # Parse turns to extract processing steps
                         for turn in turns:
                             steps = turn.get("steps", [])
                             for step in steps:
                                 step_type = step.get("step_type")
 
                                 if step_type == "tool_execution":
-                                    # Extract tool execution details
                                     step_details = step.get("step_details", {})
                                     tool_calls = step_details.get("tool_calls", [])
                                     tool_responses = step_details.get("tool_responses", [])
@@ -433,21 +551,20 @@ async def get_claim_status(
                                     for i, tool_call in enumerate(tool_calls):
                                         tool_name = tool_call.get("tool_name", "unknown")
 
-                                        # Map tool name to step
-                                        step_name = "unknown"
-                                        agent_name = "unknown"
                                         if "ocr" in tool_name.lower():
                                             step_name = "ocr"
                                             agent_name = "ocr-agent"
                                         elif "retrieve" in tool_name.lower() or "search" in tool_name.lower():
                                             step_name = "rag_retrieval"
                                             agent_name = "rag-agent"
+                                        else:
+                                            step_name = tool_name
+                                            agent_name = "unknown"
 
-                                        # Get corresponding response
                                         output_data = None
                                         if i < len(tool_responses):
                                             tool_resp = tool_responses[i]
-                                            output_data = tool_resp.get("content") if isinstance(tool_resp, dict) else tool_resp
+                                            output_data = tool_resp.get("content") if isinstance(tool_resp, dict) else str(tool_resp)
 
                                         processing_steps.append(schemas.ProcessingStepLog(
                                             step_name=step_name,
@@ -460,20 +577,16 @@ async def get_claim_status(
                                             error_message=None
                                         ))
 
-                except Exception as e:
-                    logger.warning(f"Could not fetch LlamaStack session history: {str(e)}")
+            except Exception as e:
+                logger.warning(f"Could not fetch LlamaStack session history: {str(e)}")
 
-        # Determine current step and progress
-        step_order = {
-            "ocr": 25,
-            "rag_retrieval": 75,
-            "llm_decision": 100
-        }
+        # Determine progress
+        step_progress = {"ocr": 25, "rag_retrieval": 75, "llm_decision": 100}
 
         if processing_steps:
             current_step = processing_steps[-1].step_name
-            progress = step_order.get(current_step, 50)
-        elif claim.status == "completed" or claim.status == "failed" or claim.status == "manual_review":
+            progress = step_progress.get(current_step, 50)
+        elif claim.status in [models.ClaimStatus.completed, models.ClaimStatus.failed, models.ClaimStatus.manual_review]:
             progress = 100.0
 
         return schemas.ClaimStatusResponse(
@@ -488,20 +601,21 @@ async def get_claim_status(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting claim status: {str(e)}")
+        logger.error(f"Error getting claim status: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================================
+# GET /{claim_id}/decision - Get Claim Decision
+# =============================================================================
 
 @router.get("/{claim_id}/decision", response_model=schemas.ClaimDecisionResponse)
 async def get_claim_decision(
     claim_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Get the decision details for a processed claim.
-    """
+    """Get the decision details for a processed claim."""
     try:
-        # Get the most recent decision
         query = (
             select(models.ClaimDecision)
             .where(models.ClaimDecision.claim_id == claim_id)
@@ -530,18 +644,20 @@ async def get_claim_decision(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting claim decision: {str(e)}")
+        logger.error(f"Error getting claim decision: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================================
+# GET /{claim_id}/logs - Get Claim Logs
+# =============================================================================
 
 @router.get("/{claim_id}/logs", response_model=schemas.ClaimLogsResponse)
 async def get_claim_logs(
     claim_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Get processing logs for a claim.
-    """
+    """Get processing logs for a claim."""
     try:
         query = (
             select(models.ProcessingLog)
@@ -571,50 +687,26 @@ async def get_claim_logs(
         )
 
     except Exception as e:
-        logger.error(f"Error getting claim logs: {str(e)}")
+        logger.error(f"Error getting claim logs: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/{claim_id}/decision", response_model=schemas.ClaimDecisionResponse)
-async def get_claim_decision(
-    claim_id: UUID,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get the decision for a processed claim.
-    """
-    try:
-        query = select(models.ClaimDecision).where(models.ClaimDecision.claim_id == claim_id)
-        result = await db.execute(query)
-        decision = result.scalar_one_or_none()
-
-        if not decision:
-            raise HTTPException(status_code=404, detail="Decision not found for this claim")
-
-        return schemas.ClaimDecisionResponse.model_validate(decision)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting claim decision: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+# =============================================================================
+# GET /statistics/overview - Get Claims Statistics
+# =============================================================================
 
 @router.get("/statistics/overview", response_model=schemas.ClaimStatistics)
 async def get_claim_statistics(db: AsyncSession = Depends(get_db)):
-    """
-    Get overall claims statistics.
-    """
+    """Get overall claims statistics."""
     try:
-        # Count by status
         status_counts = {}
         status_values = ["pending", "processing", "completed", "failed", "manual_review"]
+        
         for status_value in status_values:
             query = select(func.count()).where(models.Claim.status == status_value)
             result = await db.execute(query)
-            status_counts[status_value] = result.scalar()
+            status_counts[status_value] = result.scalar() or 0
 
-        # Average processing time
         avg_query = select(func.avg(models.Claim.total_processing_time_ms)).where(
             models.Claim.total_processing_time_ms.isnot(None)
         )
@@ -632,9 +724,13 @@ async def get_claim_statistics(db: AsyncSession = Depends(get_db)):
         )
 
     except Exception as e:
-        logger.error(f"Error getting statistics: {str(e)}")
+        logger.error(f"Error getting statistics: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =============================================================================
+# GET /documents/{claim_id}/view - View Claim Document
+# =============================================================================
 
 @router.get("/documents/{claim_id}/view")
 async def view_claim_document(
@@ -643,10 +739,6 @@ async def view_claim_document(
 ):
     """View claim document PDF."""
     try:
-        from fastapi.responses import FileResponse
-        import os
-
-        # Get claim
         result = await db.execute(
             select(models.Claim).where(models.Claim.id == claim_id)
         )
@@ -655,11 +747,12 @@ async def view_claim_document(
         if not claim:
             raise HTTPException(status_code=404, detail="Claim not found")
 
-        # Check if document exists
-        if not claim.document_path or not os.path.exists(claim.document_path):
-            raise HTTPException(status_code=404, detail="Document not found")
+        if not claim.document_path:
+            raise HTTPException(status_code=404, detail="No document associated with this claim")
 
-        # Return PDF file
+        if not os.path.exists(claim.document_path):
+            raise HTTPException(status_code=404, detail="Document file not found")
+
         return FileResponse(
             claim.document_path,
             media_type="application/pdf",
@@ -669,5 +762,5 @@ async def view_claim_document(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error viewing document: {str(e)}")
+        logger.error(f"Error viewing document: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

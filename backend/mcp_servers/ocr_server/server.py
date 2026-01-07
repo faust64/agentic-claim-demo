@@ -237,7 +237,9 @@ def validate_file_path(document_path: str) -> Tuple[bool, str, Path]:
 @mcp.tool()
 async def ocr_document(
     document_path: str,
-    language: str = "eng"
+    language: str = "eng",
+    document_type: str = "AUTO",
+    extract_structured: str = "false"
 ) -> str:
     """
     Extract raw text from document using OCR (EasyOCR).
@@ -252,12 +254,14 @@ async def ocr_document(
         document_path: Path to the document file (PDF, image, etc.)
         language: OCR language code (eng, fra, deu, etc.)
                  Note: Language is configured at server startup via OCR_LANGUAGES env var
+        document_type: Type hint for the document (MEDICAL, AUTO, HOME, etc.) - informational only
+        extract_structured: Whether to extract structured data - not used, always returns raw text
 
     Returns:
         JSON string with raw extracted text and confidence score
     """
     start_time = time.time()
-    logger.info(f"⏱️  OCR STARTED for document: {document_path}")
+    logger.info(f"⏱️  OCR STARTED for document: {document_path} (type: {document_type})")
 
     # Validate input
     is_valid, error_msg, doc_path = validate_file_path(document_path)
@@ -405,7 +409,6 @@ if __name__ == "__main__":
         log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
         # SSE-specific settings for persistent connections
         timeout_keep_alive=300,      # Keep connection alive for 5 minutes
-        timeout_notify=30,           # Timeout for notifying the application
         limit_concurrency=100,       # Maximum concurrent connections
         limit_max_requests=None,     # No limit on requests per connection (important for SSE)
         http="h11",                  # Use h11 HTTP implementation (better SSE support)
