@@ -1,0 +1,249 @@
+# =============================================================================
+# Global Configuration
+# =============================================================================
+global:
+  # OpenShift cluster domain (replace with your cluster domain)
+  clusterDomain: "apps.cluster-rk6mx.rk6mx.sandbox492.opentlc.com"
+
+  # Namespace where all resources will be deployed
+  namespace: claims-demo
+
+  # Image registry for custom images
+  imageRegistry: quay.io/your-org
+
+  # Image pull policy
+  imagePullPolicy: IfNotPresent
+
+# =============================================================================
+# PostgreSQL Database
+# =============================================================================
+postgresql:
+  enabled: true
+
+  # StatefulSet configuration
+  replicas: 1
+
+  # Authentication
+  auth:
+    username: claims_user
+    database: claims_db
+    # Password will be generated or provided via secret
+    existingSecret: postgresql-secret
+    secretKeys:
+      userPasswordKey: POSTGRES_PASSWORD
+
+  # Storage
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""  # Use default storage class
+
+  # Resources
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+  # Image
+  image:
+    registry: registry.redhat.io
+    repository: rhel9/postgresql-15
+    tag: latest
+
+# =============================================================================
+# LlamaStack v0.3.5
+# =============================================================================
+llamastack:
+  enabled: true
+
+  # Deployment
+  replicas: 1
+
+  # Image
+  image:
+    repository: docker.io/llamastack/distribution-rh-dev
+    tag: 0.3.5+rhai0
+    pullPolicy: IfNotPresent
+
+  # Service
+  service:
+    type: ClusterIP
+    port: 8321
+
+  # Route (OpenShift)
+  route:
+    enabled: true
+    host: ""  # Auto-generated if empty
+    tls:
+      enabled: false
+
+  # Model configuration
+  model:
+    # vLLM endpoint for Llama 3.3 70B
+    endpoint: "https://llama-3-3-70b-llama-3-3-70b.apps.CLUSTER_DOMAIN/v1"
+    name: llama-3-3-70b
+    apiToken: fake
+
+  # Embedding model
+  embedding:
+    endpoint: "https://embeddinggemma-300m-edg-demo.apps.CLUSTER_DOMAIN/v1"
+    model: gemma-300m
+    dimension: 768
+
+  # Resources
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+# =============================================================================
+# MCP Servers
+# =============================================================================
+mcp:
+  # OCR Server
+  ocr:
+    enabled: true
+    replicas: 1
+
+    image:
+      repository: ocr-server
+      tag: latest
+
+    service:
+      type: ClusterIP
+      port: 8080
+
+    # Environment variables
+    env:
+      OCR_LANGUAGES: "en,fr"
+      OCR_GPU_ENABLED: "false"
+      LOG_LEVEL: "INFO"
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+
+  # RAG Server
+  rag:
+    enabled: true
+    replicas: 1
+
+    image:
+      repository: rag-server
+      tag: latest
+
+    service:
+      type: ClusterIP
+      port: 8080
+
+    # Environment variables
+    env:
+      LOG_LEVEL: "INFO"
+      EMBEDDING_MODEL: "gemma-300m"
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 2000m
+        memory: 2Gi
+
+# =============================================================================
+# Backend API
+# =============================================================================
+backend:
+  enabled: true
+
+  # Deployment
+  replicas: 2
+
+  # Image
+  image:
+    repository: backend
+    tag: latest
+
+  # Service
+  service:
+    type: ClusterIP
+    port: 8000
+
+  # Route (OpenShift)
+  route:
+    enabled: true
+    host: ""  # Auto-generated if empty
+    tls:
+      enabled: false
+
+  # Environment variables
+  env:
+    APP_NAME: "Claims Processing Demo"
+    ENVIRONMENT: "production"
+    DEBUG: "false"
+    LOG_LEVEL: "INFO"
+
+  # Resources
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# =============================================================================
+# Frontend
+# =============================================================================
+frontend:
+  enabled: true
+
+  # Deployment
+  replicas: 2
+
+  # Image
+  image:
+    repository: frontend
+    tag: latest
+
+  # Service
+  service:
+    type: ClusterIP
+    port: 8080
+
+  # Route (OpenShift)
+  route:
+    enabled: true
+    host: ""  # Auto-generated if empty
+    tls:
+      enabled: false
+
+  # Resources
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# =============================================================================
+# Secrets
+# =============================================================================
+secrets:
+  # PostgreSQL password (base64 encoded)
+  # IMPORTANT: Replace with your own password!
+  # Generate with: echo -n "your-strong-password" | base64
+  postgresPassword: "REPLACE_WITH_BASE64_ENCODED_PASSWORD"
+
+  # Create secrets automatically
+  create: true

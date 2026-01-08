@@ -1,0 +1,73 @@
+🎉 Agentic Claims Processing Demo has been deployed!
+
+📋 Deployment Summary:
+  Namespace: {{ .Values.global.namespace }}
+  Release:   {{ .Release.Name }}
+  Chart:     {{ .Chart.Name }}-{{ .Chart.Version }}
+
+🔗 Access URLs:
+{{- if .Values.frontend.enabled }}
+  Frontend:  https://frontend-{{ .Values.global.namespace }}.{{ .Values.global.clusterDomain }}
+{{- end }}
+{{- if .Values.backend.enabled }}
+  Backend:   https://backend-{{ .Values.global.namespace }}.{{ .Values.global.clusterDomain }}/api/v1/claims
+{{- end }}
+{{- if .Values.llamastack.enabled }}
+  LlamaStack: http://llamastack-test-v035.{{ .Values.global.namespace }}.svc.cluster.local:8321
+{{- end }}
+
+📦 Components Deployed:
+{{- if .Values.postgresql.enabled }}
+  ✅ PostgreSQL Database
+{{- end }}
+{{- if .Values.llamastack.enabled }}
+  ✅ LlamaStack v0.3.5
+{{- end }}
+{{- if .Values.mcp.ocr.enabled }}
+  ✅ OCR MCP Server (EasyOCR)
+{{- end }}
+{{- if .Values.mcp.rag.enabled }}
+  ✅ RAG MCP Server (pgvector)
+{{- end }}
+{{- if .Values.backend.enabled }}
+  ✅ Backend API (FastAPI)
+{{- end }}
+{{- if .Values.frontend.enabled }}
+  ✅ Frontend (React)
+{{- end }}
+
+🚀 Next Steps:
+
+1. Wait for all pods to be ready:
+   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance={{ .Release.Name }} -n {{ .Values.global.namespace }} --timeout=300s
+
+2. Initialize database schema:
+   kubectl exec postgresql-0 -n {{ .Values.global.namespace }} -- psql -U claims_user -d claims_db -f /tmp/init.sql
+
+3. Create demo claims:
+   cd scripts && ./reset_and_create_claims.sh
+
+4. Access the application:
+   Open: https://frontend-{{ .Values.global.namespace }}.{{ .Values.global.clusterDomain }}
+
+📚 Documentation:
+   GitHub: https://github.com/mouachan/agentic-claim-demo
+   README: https://github.com/mouachan/agentic-claim-demo/blob/main/README.md
+
+🛠️  Useful Commands:
+
+  # Check deployment status
+  helm status {{ .Release.Name }} -n {{ .Values.global.namespace }}
+
+  # View logs
+  kubectl logs -l app=backend -n {{ .Values.global.namespace }}
+  kubectl logs -l app=llamastack-v035 -n {{ .Values.global.namespace }}
+
+  # Upgrade release
+  helm upgrade {{ .Release.Name }} ./helm/agentic-claims-demo -n {{ .Values.global.namespace }}
+
+  # Rollback
+  helm rollback {{ .Release.Name }} -n {{ .Values.global.namespace }}
+
+  # Uninstall
+  helm uninstall {{ .Release.Name }} -n {{ .Values.global.namespace }}

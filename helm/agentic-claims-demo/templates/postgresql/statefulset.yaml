@@ -1,0 +1,67 @@
+{{- if .Values.postgresql.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: {{ include "agentic-claims-demo.namespace" . }}
+  labels:
+    {{- include "agentic-claims-demo.labels" . | nindent 4 }}
+    app: postgresql
+spec:
+  serviceName: postgresql
+  replicas: {{ .Values.postgresql.replicas }}
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      containers:
+      - name: postgresql
+        image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
+        ports:
+        - containerPort: 5432
+          name: postgresql
+        env:
+        - name: POSTGRESQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.postgresql.auth.existingSecret }}
+              key: POSTGRES_USER
+        - name: POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.postgresql.auth.existingSecret }}
+              key: {{ .Values.postgresql.auth.secretKeys.userPasswordKey }}
+        - name: POSTGRESQL_DATABASE
+          value: {{ .Values.postgresql.auth.database }}
+        - name: POSTGRESQL_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.postgresql.auth.existingSecret }}
+              key: {{ .Values.postgresql.auth.secretKeys.userPasswordKey }}
+        volumeMounts:
+        - name: postgresql-data
+          mountPath: /var/lib/pgsql/data
+        resources:
+          {{- toYaml .Values.postgresql.resources | nindent 10 }}
+        livenessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+            - --live
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: postgresql-data
+        persistentVolumeClaim:
+          claimName: postgresql-data
+{{- end }}

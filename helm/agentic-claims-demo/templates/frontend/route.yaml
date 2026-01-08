@@ -1,0 +1,28 @@
+{{- if and .Values.frontend.enabled .Values.frontend.route.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: frontend
+  namespace: {{ include "agentic-claims-demo.namespace" . }}
+  labels:
+    {{- include "agentic-claims-demo.labels" . | nindent 4 }}
+    app: frontend
+spec:
+  {{- if .Values.frontend.route.host }}
+  host: {{ .Values.frontend.route.host }}
+  {{- else }}
+  host: frontend-{{ .Values.global.namespace }}.{{ .Values.global.clusterDomain }}
+  {{- end }}
+  to:
+    kind: Service
+    name: frontend
+    weight: 100
+  port:
+    targetPort: http
+  {{- if .Values.frontend.route.tls.enabled }}
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  {{- end }}
+  wildcardPolicy: None
+{{- end }}

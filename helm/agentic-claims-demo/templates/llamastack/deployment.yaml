@@ -1,0 +1,61 @@
+{{- if .Values.llamastack.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llamastack-test-v035
+  namespace: {{ include "agentic-claims-demo.namespace" . }}
+  labels:
+    {{- include "agentic-claims-demo.labels" . | nindent 4 }}
+    app: llamastack-v035
+spec:
+  replicas: {{ .Values.llamastack.replicas }}
+  selector:
+    matchLabels:
+      app: llamastack-v035
+  template:
+    metadata:
+      labels:
+        app: llamastack-v035
+    spec:
+      containers:
+      - name: llama-stack
+        image: {{ .Values.llamastack.image.repository }}:{{ .Values.llamastack.image.tag }}
+        imagePullPolicy: {{ .Values.llamastack.image.pullPolicy }}
+        ports:
+        - containerPort: 8321
+          name: http
+          protocol: TCP
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgresql-secret
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgresql-secret
+              key: POSTGRES_USER
+        volumeMounts:
+        - name: config
+          mountPath: /app/run.yaml
+          subPath: run.yaml
+        resources:
+          {{- toYaml .Values.llamastack.resources | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8321
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8321
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: llamastack-test-v035-config
+{{- end }}
