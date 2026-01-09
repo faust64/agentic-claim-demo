@@ -48,7 +48,7 @@ spec:
         - name: MILVUS_DB_PATH
           value: ~/.llama/milvus.db
         - name: VLLM_MAX_TOKENS
-          value: "16384"
+          value: "20000"
         - name: VLLM_API_TOKEN_1
           value: "fake"
         - name: VLLM_API_TOKEN_2
