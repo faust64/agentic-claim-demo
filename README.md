@@ -4,18 +4,18 @@ An intelligent insurance claims processing system powered by AI agents, demonstr
 
 ## Key URLs
 
-**Deployed Application** (OpenShift cluster):
-- Frontend: https://frontend-claims-demo.apps.<OPENSHIFT_CLUSTER_DOMAIN>
-- Backend API: https://backend-claims-demo.apps.<OPENSHIFT_CLUSTER_DOMAIN>/api/v1/claims/
+**Deployed Application** (replace `CLUSTER_DOMAIN` with your OpenShift cluster domain):
+- Frontend: `https://frontend-claims-demo.apps.CLUSTER_DOMAIN`
+- Backend API: `https://backend-claims-demo.apps.CLUSTER_DOMAIN/api/v1/claims/`
 
 ## Model Configuration
 
 The system uses the following AI models from OpenShift AI:
 
 - **Primary LLM**: Llama 3.3 70B INT8 (vLLM, 20K context, 4 GPUs tensor parallel)
-  - Endpoint: `https://llama-3-3-70b-llama-3-3-70b.apps.<OPENSHIFT_CLUSTER_DOMAIN>/v1`
+  - Endpoint: `https://llama-3-3-70b-llama-3-3-70b.apps.CLUSTER_DOMAIN/v1`
 - **Embeddings**: Gemma 300M (768-dim vectors)
-  - Endpoint: `https://embeddinggemma-300m-edg-demo.apps.<OPENSHIFT_CLUSTER_DOMAIN>/v1`
+  - Endpoint: `https://embeddinggemma-300m-edg-demo.apps.CLUSTER_DOMAIN/v1`
 - **Vector Store**: PostgreSQL with pgvector backend
 - **Configured in**: `openshift/configmaps/llamastack-config.yaml`
 
