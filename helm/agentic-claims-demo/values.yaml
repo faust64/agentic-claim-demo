@@ -54,59 +54,6 @@ postgresql:
     tag: latest
 
 # =============================================================================
-# LlamaStack v0.3.5
-# =============================================================================
-llamastack:
-  enabled: true
-
-  # Deployment
-  replicas: 1
-
-  # Image
-  image:
-    repository: docker.io/llamastack/distribution-rh-dev
-    tag: 0.3.5+rhai0
-    pullPolicy: IfNotPresent
-
-  # Service
-  service:
-    type: ClusterIP
-    port: 8321
-
-  # Route (OpenShift)
-  route:
-    enabled: true
-    host: ""  # Auto-generated if empty
-    tls:
-      enabled: false
-
-  # Model configuration
-  model:
-    # vLLM endpoint for Llama 3.3 70B
-    endpoint: "https://llama-3-3-70b-llama-3-3-70b.apps.CLUSTER_DOMAIN/v1"
-    name: llama-3-3-70b
-    apiToken: fake
-
-  # Embedding model
-  embedding:
-    endpoint: "https://embeddinggemma-300m-edg-demo.apps.CLUSTER_DOMAIN/v1"
-    model: gemma-300m
-    dimension: 768
-
-  # Resources
-  resources:
-    requests:
-      cpu: 500m
-      memory: 2Gi
-    limits:
-      cpu: 2000m
-      memory: 4Gi
-
-# =============================================================================
-# MCP Servers
-# =============================================================================
-mcp:
-  # OCR Server
   ocr:
     enabled: true
     replicas: 1

@@ -135,12 +135,13 @@ oc port-forward -n llama-3-3-70B service/llama-3-3-70B-metrics 8080:8080
 Pour pointer LlamaStack vers ce nouveau modèle:
 
 ```yaml
-# Dans openshift/llamastack-v0.3.5/llama-stack-config.yaml
-models:
-  - provider_id: vllm-inference-1
-    provider_type: remote::vllm
-    config:
-      url: "http://llama-3-3-70B-predictor.llama-3-3-70B.svc.cluster.local/v1"
+# Dans openshift/configmaps/llamastack-config.yaml
+providers:
+  inference:
+    - provider_id: vllm-inference-1
+      provider_type: remote::vllm
+      config:
+        url: "http://llama-3-3-70B-predictor.llama-3-3-70B.svc.cluster.local/v1"
 ```
 
 ## Cleanup

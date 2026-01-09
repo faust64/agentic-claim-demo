@@ -13,7 +13,7 @@
   Backend:   https://backend-{{ .Values.global.namespace }}.{{ .Values.global.clusterDomain }}/api/v1/claims
 {{- end }}
 {{- if .Values.llamastack.enabled }}
-  LlamaStack: http://llamastack-test-v035.{{ .Values.global.namespace }}.svc.cluster.local:8321
+  LlamaStack: http://claims-llamastack-service.{{ .Values.global.namespace }}.svc.cluster.local:8321
 {{- end }}
 
 📦 Components Deployed:
@@ -21,7 +21,7 @@
   ✅ PostgreSQL Database
 {{- end }}
 {{- if .Values.llamastack.enabled }}
-  ✅ LlamaStack v0.3.5
+  ✅ LlamaStack (OpenShift AI)
 {{- end }}
 {{- if .Values.mcp.ocr.enabled }}
   ✅ OCR MCP Server (EasyOCR)
@@ -61,7 +61,7 @@
 
   # View logs
   kubectl logs -l app=backend -n {{ .Values.global.namespace }}
-  kubectl logs -l app=llamastack-v035 -n {{ .Values.global.namespace }}
+  kubectl logs -l app=llama-stack -n {{ .Values.global.namespace }}
 
   # Upgrade release
   helm upgrade {{ .Release.Name }} ./helm/agentic-claims-demo -n {{ .Values.global.namespace }}

@@ -45,7 +45,7 @@ spec:
               name: postgresql-secret
               key: POSTGRES_PASSWORD
         - name: LLAMASTACK_ENDPOINT
-          value: "http://llamastack-test-v035.{{ include "agentic-claims-demo.namespace" . }}.svc.cluster.local:8321"
+          value: "http://claims-llamastack-service.{{ include "agentic-claims-demo.namespace" . }}.svc.cluster.local:8321"
         - name: EMBEDDING_MODEL
           value: {{ .Values.mcp.rag.env.EMBEDDING_MODEL | quote }}
         - name: LOG_LEVEL

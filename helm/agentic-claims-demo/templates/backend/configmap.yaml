@@ -23,7 +23,7 @@ data:
   DATABASE_POOL_SIZE: "10"
   DATABASE_MAX_OVERFLOW: "20"
 
-  LLAMASTACK_ENDPOINT: "http://llamastack-test-v035.{{ include "agentic-claims-demo.namespace" . }}.svc.cluster.local:8321"
+  LLAMASTACK_ENDPOINT: "http://claims-llamastack-service.{{ include "agentic-claims-demo.namespace" . }}.svc.cluster.local:8321"
   LLAMASTACK_DEFAULT_MODEL: "vllm-inference-1/{{ .Values.llamastack.model.name }}"
   LLAMASTACK_EMBEDDING_MODEL: {{ .Values.llamastack.embedding.model | quote }}
   LLAMASTACK_EMBEDDING_DIMENSION: {{ .Values.llamastack.embedding.dimension | quote }}

@@ -157,7 +157,7 @@ echo "https://frontend-claims-demo.apps.cluster-xxx.opentlc.com"
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `llamastack.enabled` | Enable LlamaStack deployment | `true` |
-| `llamastack.image.tag` | LlamaStack version | `0.3.5+rhai0` |
+| `llamastack.image.tag` | LlamaStack version | `via OpenShift AI operator` |
 | `llamastack.model.name` | LLM model name | `llama-3-3-70b` |
 | `llamastack.embedding.model` | Embedding model | `gemma-300m` |
 
@@ -338,7 +338,7 @@ oc get routes -n claims-demo
 oc logs -l app=backend -n claims-demo --tail=100 -f
 
 # LlamaStack logs
-oc logs -l app=llamastack-v035 -n claims-demo --tail=100 -f
+oc logs -l app=llama-stack -n claims-demo --tail=100 -f
 
 # MCP Server logs
 oc logs -l app=ocr-server -n claims-demo --tail=100 -f
@@ -380,7 +380,7 @@ curl https://backend-claims-demo.apps.cluster-xxx.opentlc.com/health/live
 ```
 Frontend (React)
     → Backend API (FastAPI)
-       → LlamaStack v0.3.5
+       → LlamaStack (OpenShift AI)
           ├─→ Llama 3.3 70B (reasoning)
           └─→ MCP Tools (FastMCP/SSE)
               • OCR Server (EasyOCR)
