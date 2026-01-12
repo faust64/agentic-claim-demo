@@ -411,9 +411,13 @@ oc delete pod verify-docs -n claims-demo
 ```
 
 **What the Job does:**
-- Downloads 5 test PDF files directly from GitHub repository
+- Downloads **50 test PDF files** directly from GitHub repository:
+  - 20 auto insurance claims (`claim_auto_001.pdf` to `claim_auto_020.pdf`)
+  - 15 home insurance claims (`claim_home_001.pdf` to `claim_home_015.pdf`)
+  - 15 medical claims (`claim_medical_001.pdf` to `claim_medical_015.pdf`)
 - Copies them to `/claim_documents/` in the PVC
-- These PDFs are used by the demo claims created in Step 11
+- Total size: ~216KB
+- Execution time: ~20-30 seconds
 
 **Approach 2: Using Local Script with `oc rsync` (Alternative)**
 
@@ -435,14 +439,7 @@ python generate_claim_pdfs.py
 3. Verifies the upload
 4. Cleans up the temporary pod
 
-**Note**: The test PDFs in this demo are:
-- `claim_auto_001.pdf` - T-bone collision claim
-- `claim_auto_002.pdf` - Multi-vehicle pileup
-- `claim_auto_019.pdf` - Parking lot collision
-- `claim_medical_002.pdf` - Medical claim
-- `claim_medical_012.pdf` - Medical claim
-
-These documents are referenced in the demo claims created by `scripts/reset_and_create_claims.sh`.
+**Note**: The 50 test PDFs cover various claim scenarios and are referenced by the demo claims created with `scripts/reset_and_create_claims.sh`.
 
 #### Step 3: Deploy vLLM Inference Model
 
