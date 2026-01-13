@@ -1,7 +1,12 @@
 -- Claims Demo Database Initialization Script
 -- PostgreSQL with pgvector extension for RAG capabilities
 
--- Enable pgvector extension
+-- First, enable vector extension in postgres database (required by LlamaStack)
+\c postgres
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Then switch to claims_db and enable extensions
+\c claims_db
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -353,4 +358,4 @@ $$ LANGUAGE plpgsql;
 -- ============================================================================
 -- COMPLETION
 -- ============================================================================
-COMMENT ON DATABASE current_database() IS 'Claims Processing Demo Database with pgvector for RAG';
+COMMENT ON DATABASE claims_db IS 'Claims Processing Demo Database with pgvector for RAG';

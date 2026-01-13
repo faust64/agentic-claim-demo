@@ -669,16 +669,14 @@ curl http://$BACKEND_URL/health
 
 #### Step 9: Deploy Frontend (Optional)
 
-**Note**: The frontend is primarily deployed via Helm chart. For manual deployment, you'll need to create service and route manifests.
-
-**9.1 Deploy Frontend (if deploying manually)**
+**9.1 Deploy Frontend**
 ```bash
 oc apply -f openshift/deployments/frontend-deployment.yaml
-# Note: Service and Route manifests are in the Helm chart
-# See: helm/agentic-claims-demo/templates/frontend/
+oc apply -f openshift/services/frontend-service.yaml
+oc apply -f openshift/routes/frontend-route.yaml
 ```
 
-**9.2 Get Frontend URL (if using Helm)**
+**9.2 Get Frontend URL**
 ```bash
 FRONTEND_URL=$(oc get route frontend -n claims-demo -o jsonpath='{.spec.host}')
 echo "Access the application at: https://$FRONTEND_URL"
